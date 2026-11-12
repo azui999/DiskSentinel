@@ -11,9 +11,11 @@ from datetime import datetime
 from typing import Any, Callable
 
 import pyqtgraph as pg
-from PySide6.QtCore import QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -25,9 +27,11 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -36,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import analyzer, collector, normalize
+from .. import collector, normalize, report
 from ..collector import CollectError, DiskDevice, Snapshot
 from ..store import Store
 from . import theme
@@ -170,11 +174,14 @@ class MainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._busy = False
         self._suppress_select = False
+        # 只有用户真的点了列表项（或键盘操作）才切换右侧内容。
+        # 列表重建时 Qt 可能自行设置 current index，那种"选中"必须忽略。
+        self._user_pick = False
+        self._last_report: report.Report | None = None
 
         self._build_ui()
         self._load_archived_only()
         self._update_status_bar()
-        self._show_placeholder("点击左侧【扫描硬盘】开始，所有操作均需手动触发。")
 
     # ------------------------------------------------------------------ #
     # 构造界面
@@ -186,7 +193,64 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(16, 12, 16, 8)
         root_layout.setSpacing(10)
 
-        root_layout.addLayout(self._build_toolbar())
+        root_layout.addLayout(self._build_topbar())
+
+        # 顶层功能切换：硬盘健康 / 文件功能，两个完全独立的页面
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_health_page())
+        self.stack.addWidget(self._build_files_page())
+        root_layout.addWidget(self.stack, 1)
+        self._mode_group.idClicked.connect(self.stack.setCurrentIndex)
+
+        self.setCentralWidget(root)
+        self.statusBar().showMessage("就绪")
+        self._build_status_widgets()
+
+    def _build_topbar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+
+        title = QLabel("DISKSENTINEL")
+        title.setObjectName("AppTitle")
+        bar.addWidget(title)
+
+        subtitle = QLabel("磁盘哨兵 · 数据保存在项目目录")
+        subtitle.setObjectName("Faint")
+        bar.addWidget(subtitle)
+        bar.addStretch(1)
+
+        # 顶栏只放两个模式开关（连体分段样式）；「数据目录」在底部状态栏，
+        # 「扫描/检测」贴近左侧列表，右上角不再堆按钮。
+        self.btn_mode_health = QPushButton("硬盘健康")
+        self.btn_mode_health.setObjectName("ModeFirst")
+        self.btn_mode_health.setCheckable(True)
+        self.btn_mode_health.setChecked(True)
+        self.btn_mode_health.setToolTip(
+            "硬盘 SMART 健康监控：检测硬盘、保存快照、趋势与健康报告。"
+        )
+        bar.addWidget(self.btn_mode_health)
+
+        self.btn_mode_files = QPushButton("文件功能")
+        self.btn_mode_files.setObjectName("ModeSecond")
+        self.btn_mode_files.setCheckable(True)
+        self.btn_mode_files.setToolTip(
+            "冷备硬盘文件管理：文件比对、内容校验，检查两块备份盘的同步与文件状态。"
+        )
+        bar.addWidget(self.btn_mode_files)
+
+        mode_group = QButtonGroup(self)
+        mode_group.setExclusive(True)
+        mode_group.addButton(self.btn_mode_health, 0)
+        mode_group.addButton(self.btn_mode_files, 1)
+        self._mode_group = mode_group
+        return bar
+
+    def _build_health_page(self) -> QWidget:
+        """硬盘健康功能页：左侧列表/详情分栏，动作按钮在左侧面板顶部。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -195,39 +259,36 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([340, 820])
-        root_layout.addWidget(splitter, 1)
+        layout.addWidget(splitter, 1)
+        return page
 
-        self.setCentralWidget(root)
-        self.statusBar().showMessage("就绪")
-        self._build_status_widgets()
+    def _build_files_page(self) -> QWidget:
+        """文件功能页：盘对校验 / 单盘自检 / 校验历史，三块互不干扰的子页签。"""
+        from .history_tab import HistoryTab
+        from .pair_tab import PairTab
+        from .watch_tab import WatchTab
 
-    def _build_toolbar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        bar.setSpacing(10)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(0)
 
-        title = QLabel("DISKSENTINEL")
-        title.setObjectName("AppTitle")
-        bar.addWidget(title)
+        self.files_tabs = QTabWidget()
+        self.files_tabs.setDocumentMode(True)
+        self.tab_pair = PairTab()
+        self.tab_watch = WatchTab()
+        self.tab_history = HistoryTab()
+        self.files_tabs.addTab(self.tab_pair, "盘对校验")
+        self.files_tabs.addTab(self.tab_watch, "单盘自检")
+        self.files_tabs.addTab(self.tab_history, "校验历史")
+        # 切到历史页时自动刷新，省得用户手动点刷新
+        self.files_tabs.currentChanged.connect(self._on_files_tab_changed)
+        layout.addWidget(self.files_tabs, 1)
+        return page
 
-        subtitle = QLabel("本地硬盘健康记录 · 数据保存在项目目录")
-        subtitle.setObjectName("Faint")
-        bar.addWidget(subtitle)
-        bar.addStretch(1)
-
-        self.btn_dir = QPushButton("数据目录")
-        self.btn_dir.clicked.connect(self._open_data_dir)
-        bar.addWidget(self.btn_dir)
-
-        self.btn_scan = QPushButton("扫描硬盘")
-        self.btn_scan.clicked.connect(self.on_scan)
-        bar.addWidget(self.btn_scan)
-
-        self.btn_collect = QPushButton("立即检测")
-        self.btn_collect.setObjectName("Primary")
-        self.btn_collect.setEnabled(False)
-        self.btn_collect.clicked.connect(self.on_collect)
-        bar.addWidget(self.btn_collect)
-        return bar
+    def _on_files_tab_changed(self, index: int) -> None:
+        if self.files_tabs.widget(index) is self.tab_history:
+            self.tab_history.refresh()
 
     def _build_left_panel(self) -> QWidget:
         panel = QFrame()
@@ -238,19 +299,37 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(8, 10, 8, 10)
         layout.setSpacing(6)
 
-        header = QLabel("硬盘")
-        header.setObjectName("SectionTitle")
+        header = QHBoxLayout()
         header.setContentsMargins(6, 0, 0, 0)
-        layout.addWidget(header)
+        header.setSpacing(8)
+        title = QLabel("硬盘")
+        title.setObjectName("SectionTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.btn_scan = QPushButton("扫描硬盘")
+        self.btn_scan.setToolTip("查找当前接入本机的所有硬盘")
+        self.btn_scan.clicked.connect(self.on_scan)
+        header.addWidget(self.btn_scan)
+        self.btn_collect = QPushButton("立即检测")
+        self.btn_collect.setObjectName("Primary")
+        self.btn_collect.setEnabled(False)
+        self.btn_collect.setToolTip("选中左侧一块硬盘后可用：读取并保存一次 SMART 快照")
+        self.btn_collect.clicked.connect(self.on_collect)
+        header.addWidget(self.btn_collect)
+        layout.addLayout(header)
 
         self.disk_list = QListWidget()
         self.disk_list.setSelectionMode(QListWidget.SingleSelection)
         self.disk_list.currentRowChanged.connect(self.on_disk_selected)
+        self.disk_list.itemPressed.connect(self._mark_user_pick)
+        self.disk_list.itemActivated.connect(self._mark_user_pick)
+        self.disk_list.installEventFilter(self)
         layout.addWidget(self.disk_list, 1)
 
         self.left_hint = QLabel("尚未扫描")
         self.left_hint.setObjectName("Faint")
         self.left_hint.setContentsMargins(6, 0, 0, 0)
+        self.left_hint.setWordWrap(True)
         layout.addWidget(self.left_hint)
         return panel
 
@@ -259,6 +338,43 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(8)
+
+        # 未选中硬盘时只显示居中占位，不渲染一堆空 tab
+        self.placeholder = QLabel(
+            '<div style="text-align:center;">'
+            f'<p style="font-size:17px; font-weight:600; color:{theme.TEXT_MUTED}; margin:0 0 8px 0;">未选择硬盘</p>'
+            f'<p style="font-size:12px; color:{theme.TEXT_FAINT}; margin:0;">'
+            "在左侧选择一块硬盘查看数据；列表为空时请先点【扫描硬盘】</p></div>"
+        )
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setWordWrap(True)
+        panel_layout.addWidget(self.placeholder, 1, Qt.AlignCenter)
+
+        # 扫描中的状态直接放在内容区正中：状态栏那行小字太容易被忽略
+        self.scan_state = QWidget()
+        scan_layout = QVBoxLayout(self.scan_state)
+        scan_layout.setContentsMargins(0, 0, 0, 0)
+        scan_layout.setSpacing(10)
+        scan_layout.addStretch(1)
+        scan_title = QLabel("正在扫描硬盘…")
+        scan_title.setAlignment(Qt.AlignCenter)
+        scan_title.setStyleSheet(
+            f"font-size:17px; font-weight:600; color:{theme.TEXT_MUTED};"
+        )
+        scan_layout.addWidget(scan_title)
+        self.scan_bar = QProgressBar()
+        self.scan_bar.setRange(0, 0)  # 不确定进度，Qt 自动滚动
+        self.scan_bar.setTextVisible(False)
+        self.scan_bar.setFixedSize(220, 4)
+        self.scan_bar.setObjectName("ScanBar")
+        scan_layout.addWidget(self.scan_bar, 0, Qt.AlignCenter)
+        scan_hint = QLabel("正在枚举本机的 SATA / NVMe 设备并读取识别信息，通常几秒钟。")
+        scan_hint.setAlignment(Qt.AlignCenter)
+        scan_hint.setStyleSheet(f"font-size:12px; color:{theme.TEXT_FAINT};")
+        scan_layout.addWidget(scan_hint)
+        scan_layout.addStretch(1)
+        self.scan_state.hide()
+        panel_layout.addWidget(self.scan_state, 1)
 
         # 选中"历史记录"（当前未接入本机）时的引导条。放在页签之外，
         # 这样任何页签下用户都能看到"为什么看不到实时数据、下一步该做什么"。
@@ -279,6 +395,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
+        self.tabs.hide()
 
         self.tab_overview = self._build_overview_tab()
         self.tab_attrs = self._build_attrs_tab()
@@ -336,6 +453,42 @@ class MainWindow(QMainWindow):
         self.lbl_badge.setAlignment(Qt.AlignCenter)
         header_layout.addWidget(self.lbl_badge, 0, Qt.AlignTop)
         layout.addWidget(self.header_card)
+
+        # 健康结论卡：用户只想知道"这盘还能不能用"，所以结论放在最上面，
+        # 参数明细留在下面按需查看。
+        self.verdict_card = QFrame()
+        self.verdict_card.setObjectName("Card")
+        verdict_layout = QHBoxLayout(self.verdict_card)
+        verdict_layout.setContentsMargins(16, 12, 16, 12)
+        verdict_layout.setSpacing(12)
+
+        self.verdict_bar = QFrame()
+        self.verdict_bar.setFixedWidth(3)
+        self.verdict_bar.setStyleSheet(f"background:{theme.OK}; border-radius:1px;")
+        verdict_layout.addWidget(self.verdict_bar)
+
+        verdict_text = QVBoxLayout()
+        verdict_text.setSpacing(4)
+        self.lbl_verdict_tag = QLabel("健康结论")
+        self.lbl_verdict_tag.setObjectName("Faint")
+        self.lbl_verdict_headline = QLabel("—")
+        self.lbl_verdict_headline.setWordWrap(True)
+        self.lbl_verdict_headline.setStyleSheet("font-size:15px; font-weight:600;")
+        self.lbl_verdict_action = QLabel("")
+        self.lbl_verdict_action.setObjectName("Muted")
+        self.lbl_verdict_action.setWordWrap(True)
+        verdict_text.addWidget(self.lbl_verdict_tag)
+        verdict_text.addWidget(self.lbl_verdict_headline)
+        verdict_text.addWidget(self.lbl_verdict_action)
+        verdict_layout.addLayout(verdict_text, 1)
+
+        self.btn_open_report = QPushButton("完整报告")
+        self.btn_open_report.setToolTip("查看按指标与趋势生成的完整文字报告，可整段复制")
+        self.btn_open_report.clicked.connect(
+            lambda: self.tabs.setCurrentWidget(self.tab_report)
+        )
+        verdict_layout.addWidget(self.btn_open_report, 0, Qt.AlignTop)
+        layout.addWidget(self.verdict_card)
 
         cards = QHBoxLayout()
         cards.setSpacing(12)
@@ -503,10 +656,29 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.report_hint = QLabel("")
+        self.report_hint.setObjectName("Faint")
+        self.report_hint.setWordWrap(True)
+        bar.addWidget(self.report_hint, 1)
+        self.btn_copy_report = QPushButton("复制报告")
+        self.btn_copy_report.setToolTip("把整份报告复制成纯文本，方便存档或粘给别的工具")
+        self.btn_copy_report.clicked.connect(self._copy_report)
+        bar.addWidget(self.btn_copy_report, 0, Qt.AlignTop)
+        layout.addLayout(bar)
+
         self.report_view = QTextBrowser()
         self.report_view.setOpenExternalLinks(False)
         layout.addWidget(self.report_view, 1)
         return page
+
+    def _copy_report(self) -> None:
+        if not self._last_report:
+            return
+        QApplication.clipboard().setText(self._last_report.text)
+        self.statusBar().showMessage("报告已复制到剪贴板", 4000)
 
     def _build_raw_tab(self) -> QWidget:
         page = QWidget()
@@ -537,6 +709,14 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_status_widgets(self) -> None:
+        # 「数据目录」不是功能按钮，放底部状态栏，做成蓝色文字链接
+        self.btn_dir = QPushButton("数据目录")
+        self.btn_dir.setObjectName("LinkButton")
+        self.btn_dir.setCursor(Qt.PointingHandCursor)
+        self.btn_dir.setToolTip("打开数据保存目录（disks.json 与各硬盘的快照文件）")
+        self.btn_dir.clicked.connect(self._open_data_dir)
+        self.statusBar().addPermanentWidget(self.btn_dir)
+
         self.lbl_smartctl = QLabel("")
         self.lbl_smartctl.setObjectName("Faint")
         self.statusBar().addPermanentWidget(self.lbl_smartctl)
@@ -579,6 +759,8 @@ class MainWindow(QMainWindow):
     def _fail(self, message: str) -> None:
         self._set_busy(False)
         self._worker = None
+        self._set_scanning(False)
+        self._refresh_detail()
         self.statusBar().showMessage("操作失败", 5000)
         box = QMessageBox(self)
         box.setWindowTitle("操作失败")
@@ -595,6 +777,7 @@ class MainWindow(QMainWindow):
 
     def _rebuild_list(self, devices: list[DiskDevice], keep_identity: str | None) -> None:
         self._suppress_select = True
+        self._user_pick = False
         self.disk_list.clear()
         self._rows: list[tuple[DiskDevice | None, str | None]] = []
 
@@ -635,17 +818,17 @@ class MainWindow(QMainWindow):
             online = len(devices)
             offline = len(archived)
             if online and offline:
-                self.left_hint.setText(f"已接入 {online} 块 · 历史 {offline} 块")
+                self.left_hint.setText(f"已接入 {online} 块 · 历史记录 {offline} 块")
             elif online:
                 self.left_hint.setText(f"已接入 {online} 块硬盘")
             else:
-                self.left_hint.setText(
-                    f"未扫描到硬盘，当前显示 {offline} 块历史记录；点【扫描硬盘】重新检测"
-                )
+                self.left_hint.setText("未接入本机硬盘，以下均为历史记录")
         else:
             self.left_hint.setText("尚未扫描到硬盘")
 
-        target = 0 if self._rows else -1
+        # 启动/重建后默认不选中任何硬盘，右侧显示「未选择硬盘」占位；
+        # 只有重扫后能找回原选中盘（keep_identity）时才恢复选中。
+        target = -1
         if keep_identity:
             for index, (device, key) in enumerate(self._rows):
                 if (device and device.identity == keep_identity) or key == keep_identity:
@@ -658,8 +841,12 @@ class MainWindow(QMainWindow):
             device, key = self._rows[target]
             self._apply_selection(device, key)
         else:
+            self.disk_list.clearSelection()
+            self.disk_list.setCurrentRow(-1)
             self._suppress_select = False
             self._apply_selection(None, None)
+            # Qt 有可能在布局/获得焦点时自行挑第一行，这里等事件循环空闲再清一次
+            QTimer.singleShot(0, self._clear_artifact_selection)
 
     def _add_row(
         self,
@@ -691,21 +878,100 @@ class MainWindow(QMainWindow):
     def on_scan(self) -> None:
         if self._busy:
             return
+        self._set_scanning(True)
         self._run(collector.scan_devices, self._on_scanned, "正在扫描硬盘…")
 
+    def _set_scanning(self, scanning: bool) -> None:
+        """把扫描状态放到内容区正中，并让按钮自身也表达"正在做事"。"""
+        self.btn_scan.setText("扫描中…" if scanning else "扫描硬盘")
+        self.btn_scan.setEnabled(not scanning)
+        if scanning:
+            self.placeholder.hide()
+            self.tabs.hide()
+            self.offline_notice.hide()
+            self.scan_state.show()
+            self.left_hint.setText("正在扫描本机硬盘…")
+        else:
+            self.scan_state.hide()
+
     def _on_scanned(self, devices: list[DiskDevice]) -> None:
+        self._set_scanning(False)
         self.devices = devices
-        keep = None
-        if self.current_device is not None:
-            keep = self.current_device.identity
-        elif self.current_key:
-            keep = self.current_key
+        # 只沿用"用户自己选中过"的那块盘；用户没选就保持未选中状态
+        keep = self._selected_identity()
         self._rebuild_list(devices, keep)
         reachable = [d for d in devices if d.reachable]
         self.statusBar().showMessage(f"扫描完成，发现 {len(reachable)} 块可访问硬盘", 6000)
 
+    def _selected_identity(self) -> str | None:
+        if self.current_device is not None:
+            return self.current_device.identity
+        if self.current_key:
+            return self.current_key
+        return None
+
+    def _mark_user_pick(self, *_args: Any) -> None:
+        """鼠标点选/回车确认 = 用户真的想切换这块盘。"""
+        self._user_pick = True
+
+    def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 (Qt 命名)
+        # 键盘上下键同样是用户主动选择
+        if (
+            obj is getattr(self, "disk_list", None)
+            and event.type() == QEvent.KeyPress
+            and event.key()
+            in (
+                Qt.Key_Up,
+                Qt.Key_Down,
+                Qt.Key_Home,
+                Qt.Key_End,
+                Qt.Key_PageUp,
+                Qt.Key_PageDown,
+            )
+        ):
+            self._user_pick = True
+        return super().eventFilter(obj, event)
+
+    def _clear_artifact_selection(self) -> None:
+        """把 Qt 自行设置的"假选中"纠正回来。
+
+        有正在展示的硬盘时把高亮恢复到它；否则清空选中，
+        避免出现"列表高亮某一行、右侧却是未选择硬盘"的不一致。
+        """
+        target = -1
+        for index, (device, key) in enumerate(self._rows):
+            if self.current_device is not None and device is self.current_device:
+                target = index
+                break
+            if self.current_key and key == self.current_key:
+                target = index
+                break
+
+        self._suppress_select = True
+        if target >= 0:
+            self.disk_list.setCurrentRow(target)
+        else:
+            self.disk_list.clearSelection()
+            self.disk_list.setCurrentRow(-1)
+        self._suppress_select = False
+        self._user_pick = False
+
     def on_disk_selected(self, row: int) -> None:
         if self._suppress_select or row < 0 or row >= len(self._rows):
+            return
+        # 注意：Qt 的事件顺序是 currentRowChanged → itemPressed → itemClicked，
+        # 所以不能在信号里立刻判断"是不是用户点的"，必须延后一帧再看。
+        QTimer.singleShot(0, lambda r=row: self._apply_row_if_user(r))
+
+    def _apply_row_if_user(self, row: int) -> None:
+        picked = self._user_pick
+        self._user_pick = False
+        if not picked:
+            # 列表重建时 Qt 可能自行挑一行，那种"选中"要纠正回来，否则会出现
+            # 左边高亮、右边仍是"未选择硬盘"（或内容与高亮不符）的不一致。
+            self._clear_artifact_selection()
+            return
+        if row < 0 or row >= len(self._rows):
             return
         device, key = self._rows[row]
         self._apply_selection(device, key)
@@ -782,27 +1048,24 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # 详情渲染
     # ------------------------------------------------------------------ #
-    def _show_placeholder(self, text: str) -> None:
-        self.lbl_model.setText("未选择硬盘")
-        self.lbl_sub.setText(text)
+    def _show_no_selection(self) -> None:
+        """右侧只显示居中的「未选择硬盘」，空 tab 一概不展示。"""
+        self.scan_state.hide()
+        self.placeholder.show()
+        self.tabs.hide()
         self.offline_notice.hide()
-        self._set_badge("none")
-        for card in (self.card_status, self.card_hours, self.card_temp, self.card_wear):
-            card.set_value("—")
-        self.metrics_table.setRowCount(0)
-        self.report_view.setHtml(f'<p style="color:{theme.TEXT_MUTED}">{text}</p>')
-        self.raw_view.setPlainText("")
-        self.metric_combo.clear()
-        self.snapshot_combo.clear()
-        self.plot.clear()
 
     def _refresh_detail(self) -> None:
         device = self.current_device
         key = self.current_key
 
         if device is None and key is None:
-            self._show_placeholder("请选择左侧硬盘。")
+            self._show_no_selection()
             return
+
+        self.scan_state.hide()
+        self.placeholder.hide()
+        self.tabs.show()
 
         entry = self.store.disks().get(key or "", {})
         history: list[dict[str, Any]] = self.store.history(key) if key else []
@@ -838,11 +1101,15 @@ class MainWindow(QMainWindow):
                 card.set_value("—")
             self.metrics_table.setRowCount(0)
             hint = (
-                "该硬盘尚未保存任何快照。点击右上角【立即检测】开始第一次记录。"
+                "该硬盘尚未保存任何快照。点击左上角【立即检测】开始第一次记录。"
                 if device
                 else "这块硬盘目前没有接入本机，也没有任何历史快照。接上后再扫描即可检测。"
             )
-            self.report_view.setHtml(f'<p style="color:{theme.TEXT_MUTED}">{hint}</p>')
+            self._last_report = report.build([], None, model=str(model or ""))
+            self._last_report.headline = hint
+            self._last_report.action = "检测一次之后，这里会生成可读的健康结论。"
+            self._render_verdict(self._last_report)
+            self._render_report(self._last_report)
             self.metric_combo.clear()
             self.snapshot_combo.clear()
             self.plot.clear()
@@ -855,7 +1122,14 @@ class MainWindow(QMainWindow):
 
         self._render_overview(current, history)
         self._render_attrs(raw, str(current.get("snapshot_id", "")))
-        self._render_report(history)
+
+        # 报告只用一套逻辑生成，概览的结论卡和「健康报告」页签共享同一份
+        is_ssd = device.is_ssd if device else None
+        self._last_report = report.build(
+            history, raw, model=str(model or ""), is_ssd=is_ssd
+        )
+        self._render_verdict(self._last_report)
+        self._render_report(self._last_report)
         self._fill_metric_combo(history)
         self._fill_snapshot_combo(key or "")
 
@@ -994,40 +1268,88 @@ class MainWindow(QMainWindow):
             "padding:4px 14px; font-size:12px; font-weight:600;"
         )
 
-    def _render_report(self, history: list[dict[str, Any]]) -> None:
-        findings = analyzer.analyze(history)
-        level, summary = analyzer.summarize(findings)
-        color = theme.LEVEL_COLORS.get(level, theme.INFO)
+    def _render_verdict(self, rep: report.Report) -> None:
+        """概览顶部的一句话结论：等级色条 + 结论 + 建议行动。"""
+        color = theme.LEVEL_COLORS.get(rep.level, theme.INFO)
+        self.verdict_bar.setStyleSheet(f"background:{color}; border-radius:1px;")
+        self.lbl_verdict_tag.setText(f"健康结论 · {rep.level_text}")
+        self.lbl_verdict_tag.setStyleSheet(f"color:{color}; font-size:12px; font-weight:600;")
+        self.lbl_verdict_headline.setText(rep.headline)
+        self.lbl_verdict_headline.setStyleSheet(
+            f"font-size:15px; font-weight:600; color:{color};"
+        )
+        self.lbl_verdict_action.setText(rep.action)
 
-        rows = []
-        for finding in findings:
-            item_color = theme.LEVEL_COLORS.get(finding.level, theme.INFO)
-            detail = (
-                f'<div style="color:{theme.TEXT_MUTED}; font-size:12px; margin-top:2px;">{finding.detail}</div>'
-                if finding.detail
-                else ""
-            )
-            rows.append(
-                f'<div style="margin:0 0 12px 0;">'
-                f'<span style="color:{item_color}; font-weight:600;">[{finding.level_text}]</span> '
-                f'<span style="font-weight:600;">{finding.title}</span>'
-                f"{detail}</div>"
+    def _render_report(self, rep: report.Report) -> None:
+        """健康报告页签：结论 → 依据 → 趋势 → 建议，全部是给人看的话。"""
+        color = theme.LEVEL_COLORS.get(rep.level, theme.INFO)
+        chunks: list[str] = []
+
+        def section(title: str) -> str:
+            return (
+                f'<div style="font-size:13px; font-weight:600; color:{theme.TEXT};'
+                f' margin:18px 0 6px 0;">{title}</div>'
             )
 
-        current = history[-1]
-        meta = [
-            f"共 {len(history)} 次检测记录",
-            f"本次检测时间 {current.get('timestamp', '—')}",
-        ]
+        # 结论
+        chunks.append(
+            '<div style="border-left:3px solid %s; padding-left:12px; margin-bottom:4px;">'
+            '<div style="font-size:12px; font-weight:600; color:%s;">%s</div>'
+            '<div style="font-size:15px; font-weight:600; margin-top:4px;">%s</div>'
+            '<div style="font-size:12px; color:%s; margin-top:6px;">建议行动：%s</div>'
+            "</div>"
+            % (color, color, rep.level_text, rep.headline, theme.TEXT_MUTED, rep.action)
+        )
+
+        if rep.basis:
+            chunks.append(section("判断依据"))
+            for item in rep.basis:
+                item_color = theme.LEVEL_COLORS.get(item.level, theme.INFO)
+                chunks.append(
+                    f'<div style="margin:0 0 8px 0;">'
+                    f'<span style="color:{item_color}; font-weight:600;">{item.label}</span>'
+                    f'<span style="color:{theme.TEXT};">：{item.value}</span>'
+                    f'<div style="color:{theme.TEXT_MUTED}; font-size:12px; margin-top:2px;'
+                    f' line-height:150%;">{item.why}</div></div>'
+                )
+        else:
+            chunks.append(section("判断依据"))
+            chunks.append(
+                f'<div style="color:{theme.TEXT_MUTED}; font-size:12px;">'
+                "本次检测的所有关键指标都在正常范围内，没有需要单独说明的项目。</div>"
+            )
+
+        if rep.trends:
+            chunks.append(section("趋势观察"))
+            for line in rep.trends:
+                chunks.append(
+                    f'<div style="color:{theme.TEXT_MUTED}; font-size:12px; margin-bottom:5px;'
+                    f' line-height:150%;">· {line}</div>'
+                )
+
+        if rep.advice:
+            chunks.append(section("建议"))
+            for index, line in enumerate(rep.advice, 1):
+                chunks.append(
+                    f'<div style="font-size:12px; margin-bottom:5px; line-height:150%;">'
+                    f'{index}. {line}</div>'
+                )
+
+        if rep.meta:
+            chunks.append(
+                f'<div style="color:{theme.TEXT_FAINT}; font-size:11px; margin-top:18px;'
+                f' border-top:1px solid {theme.BORDER}; padding-top:8px; line-height:150%;">'
+                + "<br>".join(rep.meta)
+                + "</div>"
+            )
+
         html = (
             f'<div style="font-family:\'Microsoft YaHei UI\',sans-serif; color:{theme.TEXT};">'
-            f'<div style="font-size:15px; font-weight:600; color:{color}; margin-bottom:4px;">{summary}</div>'
-            f'<div style="color:{theme.TEXT_MUTED}; font-size:12px; margin-bottom:16px;">'
-            f'{" · ".join(meta)}</div>'
-            + "".join(rows)
+            + "".join(chunks)
             + "</div>"
         )
         self.report_view.setHtml(html)
+        self.report_hint.setText("报告由本程序按指标与趋势规则生成，可直接复制")
 
     def _fill_metric_combo(self, history: list[dict[str, Any]]) -> None:
         keys = [

@@ -10,4 +10,4 @@ venv/
 build/
 dist/
 *.spec
-测试文件夹
+.workbuddy

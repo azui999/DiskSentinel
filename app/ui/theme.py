@@ -109,8 +109,44 @@ QPushButton:hover {{
     border-color: {ACCENT};
     color: {ACCENT};
 }}
+QPushButton#ModeFirst, QPushButton#ModeSecond {{
+    padding: 6px 22px;
+    font-weight: 500;
+}}
+/* 顶栏连体分段开关：左键右圆角、右键左圆角，中间不画分隔线 */
+QPushButton#ModeFirst {{
+    border-radius: 7px 0 0 7px;
+    border-right: none;
+}}
+QPushButton#ModeSecond {{
+    border-radius: 0 7px 7px 0;
+}}
+QPushButton#ModeFirst:checked, QPushButton#ModeSecond:checked {{
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+    color: #ffffff;
+    font-weight: 600;
+}}
+QPushButton#ModeFirst:checked {{
+    border-right: none;
+}}
 QPushButton:pressed {{
     background: #eef3ff;
+}}
+/* 底部状态栏的「数据目录」：蓝色文字链接，无边框 */
+QPushButton#LinkButton {{
+    background: transparent;
+    border: none;
+    color: {ACCENT};
+    padding: 2px 10px;
+    font-size: 12px;
+}}
+QPushButton#LinkButton:hover {{
+    color: {ACCENT_DARK};
+}}
+QPushButton#LinkButton:pressed {{
+    background: transparent;
+    color: {ACCENT_DARK};
 }}
 QPushButton#Primary {{
     background: {ACCENT};
@@ -174,11 +210,27 @@ QTableWidget {{
     background: {CARD};
     border: none;
     gridline-color: #f2f3f5;
+    alternate-background-color: #fafbfc;
     selection-background-color: #eef3ff;
     selection-color: {TEXT};
 }}
 QTableWidget::item {{
     padding: 4px 6px;
+}}
+QTreeWidget {{
+    background: {CARD};
+    border: none;
+    outline: none;
+}}
+QTreeWidget::item {{
+    padding: 3px 2px;
+}}
+QTreeWidget::item:hover {{
+    background: #f7f9fc;
+}}
+QTreeWidget::item:selected {{
+    background: #eef3ff;
+    color: {TEXT};
 }}
 QHeaderView::section {{
     background: #fafbfc;
@@ -192,6 +244,15 @@ QPlainTextEdit, QTextBrowser {{
     background: {CARD};
     border: none;
     selection-background-color: #eef3ff;
+}}
+QProgressBar#ScanBar {{
+    background: #e6e8ec;
+    border: none;
+    border-radius: 2px;
+}}
+QProgressBar#ScanBar::chunk {{
+    background: {ACCENT};
+    border-radius: 2px;
 }}
 QComboBox {{
     background: {CARD};
