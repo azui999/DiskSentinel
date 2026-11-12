@@ -1,0 +1,13 @@
+# 采集数据不入库
+data/
+# 临时探测输出
+.probe/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+测试文件夹
