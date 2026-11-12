@@ -10,6 +10,9 @@
 """
 from __future__ import annotations
 
+import os
+import tempfile
+
 ACCENT = "#2f6fed"
 ACCENT_DARK = "#2560d8"
 ACCENT_SOFT = "#eef3ff"      # 品牌色的浅底（选中态 / 徽章）
@@ -34,6 +37,42 @@ LEVEL_COLORS = {
     "warning": WARN,
     "error": CRIT,
 }
+
+
+def _branch_arrow_assets() -> tuple[str, str]:
+    """生成树的展开/收起箭头 SVG，返回 (收起, 展开) 两个文件的路径。
+
+    QSS 一旦写了 `::branch` 规则，Qt 就改用样式表绘制分支区，不指定
+    image 时默认三角箭头会直接消失——所以必须自带两张小图。
+    放临时目录，随启动重新生成，不污染安装目录。
+    """
+    try:
+        d = os.path.join(tempfile.gettempdir(), "DiskSentinel_theme")
+        os.makedirs(d, exist_ok=True)
+        closed = os.path.join(d, "arrow_closed.svg").replace("\\", "/")
+        opened = os.path.join(d, "arrow_open.svg").replace("\\", "/")
+        tpl = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9">'
+            '<path d="{d}" fill="none" stroke="#9aa0a6" stroke-width="1.4" '
+            'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        )
+        with open(closed, "w", encoding="utf-8") as f:
+            f.write(tpl.format(d="M3 1.8 L7 4.5 L3 7.2"))   # 右向小箭头 ▸
+        with open(opened, "w", encoding="utf-8") as f:
+            f.write(tpl.format(d="M1.8 3 L4.5 7 L7.2 3"))   # 下向小箭头 ▾
+        return closed, opened
+    except OSError:
+        return "", ""
+
+
+_ARROW_CLOSED, _ARROW_OPEN = _branch_arrow_assets()
+_BRANCH_RULES = (
+    f'QTreeWidget::branch:closed:has-children {{ image: url("{_ARROW_CLOSED}"); }}\n'
+    f'QTreeWidget::branch:open:has-children {{ image: url("{_ARROW_OPEN}"); }}'
+    if _ARROW_CLOSED
+    else ""
+)
+
 
 QSS = f"""
 QWidget {{
@@ -268,9 +307,10 @@ QTreeWidget {{
     background: {CARD};
     border: none;
     outline: none;
+    alternate-background-color: #fafbfc;
 }}
 QTreeWidget::item {{
-    padding: 4px 2px;
+    padding: 5px 4px;
 }}
 QTreeWidget::item:hover {{
     background: #f7f9fc;
@@ -282,6 +322,10 @@ QTreeWidget::item:selected {{
 QTreeWidget::branch {{
     background: transparent;
 }}
+QTreeWidget::branch:selected {{
+    background: {ACCENT_SOFT};
+}}
+{_BRANCH_RULES}
 
 /* ---------- 输入控件 ---------- */
 QPlainTextEdit, QTextBrowser {{

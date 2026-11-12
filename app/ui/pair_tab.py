@@ -166,8 +166,9 @@ class PairTab(QWidget):
         top.addWidget(self.btn_remove)
         self.btn_compare = QPushButton("结构比对")
         self.btn_compare.setToolTip(
-            "扫描两侧的文件名、大小、修改时间并比对（不读文件内容）。\n"
-            "能发现：缺文件 / 多文件 / 大小不同 / 时间不同。"
+            "扫描两侧的文件名、大小并比对（不读文件内容）。\n"
+            "修改时间不参与判断——拷贝时间本来就会不同。\n"
+            "能发现：缺文件 / 多文件 / 大小不同。"
         )
         self.btn_compare.clicked.connect(self.on_compare)
         top.addWidget(self.btn_compare)
@@ -238,16 +239,15 @@ class PairTab(QWidget):
         # 统计卡行
         cards = QHBoxLayout()
         cards.setSpacing(10)
-        self.card_same = CountCard("完全一致", "两侧文件名、大小、修改时间都相同的文件数")
+        self.card_same = CountCard("完全一致", "两侧文件名、大小都相同的文件数（修改时间不参与判断）")
         self.card_only_a = CountCard("只在 A", "只有 A 侧有、B 侧缺失的文件（通常是漏同步）")
         self.card_only_b = CountCard("只在 B", "只有 B 侧有、A 侧缺失的文件（通常是 B 侧多出来的）")
         self.card_size = CountCard("大小不同", "同名文件两侧大小不一样，多半是没拷完或被截断")
-        self.card_mtime = CountCard("时间不同", "大小相同但修改时间不同，通常是重新保存过")
         self.card_content = CountCard(
-            "内容不同", "大小和时间都相同、但 SHA-256 不同——这是静默损坏的唯一证据"
+            "内容不同", "大小相同、但 SHA-256 指纹不同——这是静默损坏的唯一证据"
         )
         for card in (self.card_same, self.card_only_a, self.card_only_b,
-                     self.card_size, self.card_mtime, self.card_content):
+                     self.card_size, self.card_content):
             cards.addWidget(card, 1)
         layout.addLayout(cards)
 
@@ -323,7 +323,7 @@ class PairTab(QWidget):
 
     def _reset_cards(self) -> None:
         for card in (self.card_same, self.card_only_a, self.card_only_b,
-                     self.card_size, self.card_mtime, self.card_content):
+                     self.card_size, self.card_content):
             card.set_value("—")
 
     def current_pair(self) -> Pair | None:
@@ -735,8 +735,6 @@ class PairTab(QWidget):
                                    theme.WARN if counts.get("only_b") else None)
         self.card_size.set_value(f"{counts.get('size_diff', 0):,}",
                                  theme.CRIT if counts.get("size_diff") else None)
-        self.card_mtime.set_value(f"{counts.get('mtime_diff', 0):,}",
-                                  theme.INFO if counts.get("mtime_diff") else None)
         self.card_content.set_value(f"{counts.get('content_diff', 0):,}",
                                     theme.CRIT if counts.get("content_diff") else None)
 

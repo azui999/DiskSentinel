@@ -5,8 +5,9 @@
 
 设计要点（与盘对页一致）：
   * 行上只显示"文件名 + 关键问题"，大小/时间/指纹/建议放 tooltip 与底部详情；
-  * 问题按严重程度着色：内容损坏/大小不同=红，缺失/只在单侧=橙，
-    新增/已修改/时间不同=灰蓝；父级文件夹跟随子树中最严重的问题着色；
+  * 修改时间不参与判断（拷贝时间本来就会不同），文件是否同一份看名字+大小+指纹；
+  * 有问题就是红色：内容损坏/大小不同加粗标红，缺失/只在单侧标红，
+    新增/已修改这类正常变动用灰蓝；父级文件夹跟随子树中最严重的问题着色；
   * 没有问题的文件夹默认收缩，且只有在展开时才真正创建子项（大目录不卡）。
 """
 from __future__ import annotations
@@ -38,7 +39,8 @@ from .common import fmt_size
 # 一个文件夹里有太多问题文件时不自动展开，避免一次创建上万项卡住界面
 AUTO_EXPAND_LIMIT = 400
 
-SEV_COLOR = {2: theme.CRIT, 1: theme.WARN, 0: theme.INFO}
+# 有问题一律红：2=红+加粗（数据可能坏了），1=红（对不上），0=灰蓝（正常变动）
+SEV_COLOR = {2: theme.CRIT, 1: theme.CRIT, 0: theme.INFO}
 
 
 # ---------------------------------------------------------------------- #
@@ -78,9 +80,10 @@ def _file_item(node: FileNode, side: str, names: dict[str, str]) -> QTreeWidgetI
         color = SEV_COLOR[sev]
         item.setForeground(0, QColor(color))
         item.setForeground(1, QColor(color))
-        if sev >= 1:
+        if sev >= 2:
             font = item.font(1)
             font.setBold(True)
+            item.setFont(0, font)
             item.setFont(1, font)
     else:
         item.setForeground(0, QColor(theme.TEXT_MUTED))
@@ -174,7 +177,9 @@ class _DetailBar(QFrame):
                 f"{difftree.advice(node)}"
             )
         else:
-            self.lbl_advice.setText("两侧文件名、大小、修改时间都一致。")
+            self.lbl_advice.setText(
+                "两侧文件名、大小一致；修改时间不参与判断，拷贝时间不同不算差异。"
+            )
 
 
 def _make_tree() -> QTreeWidget:
@@ -183,10 +188,10 @@ def _make_tree() -> QTreeWidget:
     tree.setHeaderLabels(["名称", "问题"])
     tree.setUniformRowHeights(True)   # 大目录下的关键性能开关
     tree.setAnimated(False)
-    tree.setIndentation(14)
+    tree.setIndentation(18)
     tree.setSelectionMode(QTreeWidget.SingleSelection)
     tree.setEditTriggers(QTreeWidget.NoEditTriggers)
-    tree.setAlternatingRowColors(False)
+    tree.setAlternatingRowColors(True)   # 隔行浅色，宽表好扫读
     tree.setExpandsOnDoubleClick(True)
     tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     header = tree.header()

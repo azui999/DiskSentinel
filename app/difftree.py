@@ -218,6 +218,8 @@ def load_compare(store, run_id: int) -> DirNode:
     issues: dict[str, str] = {}
     with store.connect() as conn:
         for row in conn.execute("SELECT path, category FROM diffs WHERE run_id=?", (int(run_id),)):
+            if str(row["category"]) == "mtime_diff":
+                continue  # 旧版把"修改时间不同"也当问题，现在不算
             issues[str(row["path"]).lower()] = str(row["category"])
         cur_a = conn.execute(
             "SELECT key, display, size, mtime_ns, '' AS sha256 FROM manifests"
@@ -238,6 +240,8 @@ def load_verify(store, run_id: int) -> DirNode:
 
     issues: dict[str, str] = {}
     for row in verify.run_rows(store, int(run_id)):
+        if str(row["category"]) == "mtime_diff":
+            continue  # 旧版把"修改时间不同"也当问题，现在不算
         issues[str(row["path"]).lower()] = str(row["category"])
 
     with store.connect() as conn:
@@ -329,8 +333,9 @@ def advice(node: FileNode) -> str:
         return "同名文件两侧大小不同，通常是一次拷贝没完成或文件被截断；以较大且能正常打开的一侧为准。"
     if node.issue == "content_diff":
         return (
-            "大小和修改时间都相同，但 SHA-256 不同——这是静默损坏（如照片下半部分变纯色）。"
-            "先打开确认哪一侧能正常显示，再用完好的一侧覆盖损坏的一侧。"
+            "大小相同，但 SHA-256 指纹不同——内容确实不一样。可能是静默损坏"
+            "（如照片下半部分变纯色），也可能是文件被改过。"
+            "先打开确认哪一侧是想要的，再用完好的一侧覆盖另一侧。"
         )
     if node.issue == "mtime_diff":
         return "大小相同、修改时间不同，通常是重新保存或复制方式不同导致，内容很可能一致；介意的话跑一次内容校验确认。"

@@ -495,11 +495,9 @@ def _compare_into(
                 result.counts[CAT_SIZE] += 1
                 diff_rows.append((run_id, CAT_SIZE, fa["display"], fa["size"], fb["size"],
                                   fa["mtime_ns"], fb["mtime_ns"]))
-            elif fa["mtime_ns"] != fb["mtime_ns"]:
-                result.counts[CAT_MTIME] += 1
-                diff_rows.append((run_id, CAT_MTIME, fa["display"], fa["size"], fb["size"],
-                                  fa["mtime_ns"], fb["mtime_ns"]))
             else:
+                # 修改时间不参与判断：拷贝时间本来就会不同，
+                # 是否同一个文件由文件名 + 大小（+ 内容校验时的哈希）决定。
                 result.counts[CAT_SAME] += 1
             fa = cursor_a.fetchone()
             fb = cursor_b.fetchone()

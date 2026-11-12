@@ -408,17 +408,11 @@ def _compare(
             })
             fb = cb.fetchone()
         else:
+            # 修改时间不参与判断（拷贝时间本来就会不同），文件是否同一份看大小 + 哈希
             if fa["size"] != fb["size"]:
                 result.counts[CAT_SIZE] += 1
                 result.rows.append({
                     "category": CAT_SIZE, "path": fa["display"],
-                    "size_a": fa["size"], "size_b": fb["size"],
-                    "sha_a": "", "sha_b": "",
-                })
-            elif fa["mtime_ns"] != fb["mtime_ns"]:
-                result.counts[CAT_MTIME] += 1
-                result.rows.append({
-                    "category": CAT_MTIME, "path": fa["display"],
                     "size_a": fa["size"], "size_b": fb["size"],
                     "sha_a": "", "sha_b": "",
                 })
