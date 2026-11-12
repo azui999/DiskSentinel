@@ -89,6 +89,77 @@ class Report:
             lines.append("数据说明：" + "；".join(self.meta))
         return "\n".join(lines).strip() + "\n"
 
+    @property
+    def html(self) -> str:
+        """独立 HTML 版：方便存档、打印或发给别人看。"""
+        colors = {
+            "ok": ("#16803c", "#e8f6ee"),
+            "info": ("#2563eb", "#eef3ff"),
+            "warn": ("#b45309", "#fdf3e3"),
+            "crit": ("#b91c1c", "#fdeaea"),
+        }
+        fg, bg = colors.get(self.level, colors["info"])
+
+        def esc(text: str) -> str:
+            return (
+                str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+
+        basis_html = "".join(
+            f'<li><span class="label">{esc(b.label)}</span>'
+            f'<span class="value">{esc(b.value)}</span>'
+            f'<span class="why">{esc(b.why)}</span></li>'
+            for b in self.basis
+        )
+        trends_html = "".join(f"<li>{esc(t)}</li>" for t in self.trends)
+        advice_html = "".join(f"<li>{esc(a)}</li>" for a in self.advice)
+        meta = "；".join(esc(m) for m in self.meta)
+
+        sections = []
+        if basis_html:
+            sections.append(f"<h2>一、判断依据</h2><ul class='basis'>{basis_html}</ul>")
+        if trends_html:
+            sections.append(f"<h2>二、趋势观察</h2><ul>{trends_html}</ul>")
+        if advice_html:
+            sections.append(f"<h2>三、建议</h2><ol>{advice_html}</ol>")
+
+        generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>硬盘健康报告</title>
+<style>
+  body {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+         color:#1f2328; background:#fff; margin:0; padding:32px 40px; line-height:1.7; }}
+  .wrap {{ max-width: 860px; margin: 0 auto; }}
+  .head {{ border-left: 5px solid {fg}; background: {bg}; border-radius: 8px;
+           padding: 16px 20px; margin-bottom: 24px; }}
+  .tag {{ display:inline-block; font-size: 12px; color:{fg}; border:1px solid {fg};
+          border-radius: 999px; padding: 1px 10px; margin-bottom: 8px; }}
+  .head h1 {{ font-size: 20px; margin: 0 0 6px 0; color: {fg}; }}
+  .head .action {{ font-size: 14px; color:#374151; margin:0; }}
+  h2 {{ font-size: 15px; margin: 26px 0 10px; padding-bottom: 6px;
+        border-bottom: 1px solid #eef0f2; }}
+  ul, ol {{ padding-left: 22px; }}
+  li {{ margin: 8px 0; }}
+  ul.basis {{ list-style: none; padding-left: 0; }}
+  ul.basis li {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }}
+  ul.basis .label {{ font-weight: 600; min-width: 120px; }}
+  ul.basis .value {{ color: {fg}; font-weight: 600; }}
+  ul.basis .why {{ color: #6b7280; font-size: 13px; flex: 1 1 320px; }}
+  .meta {{ margin-top: 28px; padding-top: 12px; border-top: 1px solid #eef0f2;
+           color: #9aa1a9; font-size: 12px; }}
+</style></head>
+<body><div class="wrap">
+  <div class="head">
+    <span class="tag">{esc(self.level_text)}</span>
+    <h1>{esc(self.headline)}</h1>
+    <p class="action">建议行动：{esc(self.action)}</p>
+  </div>
+  {''.join(sections)}
+  <div class="meta">{meta}<br>生成时间：{generated}</div>
+</div></body></html>
+"""
+
 
 # ---------------------------------------------------------------------- #
 # 小工具

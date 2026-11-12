@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import ctypes
+import csv
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 import pyqtgraph as pg
@@ -40,10 +42,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import collector, normalize, report
+from .. import backup, collector, normalize, report
 from ..collector import CollectError, DiskDevice, Snapshot
 from ..store import Store
 from . import theme
+from .recycle_bin import RecycleBinDialog
 
 pg.setConfigOptions(antialias=True, background="#ffffff", foreground="#6b7280")
 
@@ -143,8 +146,8 @@ class StatCard(QFrame):
         super().__init__()
         self.setObjectName("Card")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(4)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(3)
         self.title_label = QLabel(title)
         self.title_label.setObjectName("CardTitle")
         self.value_label = QLabel("—")
@@ -178,6 +181,7 @@ class MainWindow(QMainWindow):
         # 列表重建时 Qt 可能自行设置 current index，那种"选中"必须忽略。
         self._user_pick = False
         self._last_report: report.Report | None = None
+        self._backup_worker: Worker | None = None
 
         self._build_ui()
         self._load_archived_only()
@@ -217,6 +221,19 @@ class MainWindow(QMainWindow):
         subtitle = QLabel("磁盘哨兵 · 数据保存在项目目录")
         subtitle.setObjectName("Faint")
         bar.addWidget(subtitle)
+
+        # 长任务（内容校验 / 单盘复检）进行中的全局指示：切到别的页签也看得到，
+        # 点一下直接跳回正在跑的页面。空闲时整个按钮隐藏。
+        self.btn_activity = QPushButton("")
+        self.btn_activity.setObjectName("ActivityPill")
+        self.btn_activity.setCursor(Qt.PointingHandCursor)
+        self.btn_activity.setToolTip("点击回到正在运行的页面")
+        self.btn_activity.clicked.connect(self._goto_activity)
+        self.btn_activity.hide()
+        bar.addWidget(self.btn_activity)
+        self._activity_source = ""
+        self._activity_text = ""
+
         bar.addStretch(1)
 
         # 顶栏只放两个模式开关（连体分段样式）；「数据目录」在底部状态栏，
@@ -284,7 +301,31 @@ class MainWindow(QMainWindow):
         # 切到历史页时自动刷新，省得用户手动点刷新
         self.files_tabs.currentChanged.connect(self._on_files_tab_changed)
         layout.addWidget(self.files_tabs, 1)
+
+        self.tab_pair.activity.connect(lambda text: self._set_activity("pair", text))
+        self.tab_watch.activity.connect(lambda text: self._set_activity("watch", text))
         return page
+
+    def _set_activity(self, source: str, text: str) -> None:
+        if text:
+            self._activity_source = source
+            self._activity_text = text
+            self.btn_activity.setText(text)
+            self.btn_activity.show()
+        else:
+            self._activity_source = ""
+            self._activity_text = ""
+            self.btn_activity.hide()
+
+    def _goto_activity(self) -> None:
+        """点顶栏的进行中指示：切到文件功能里对应的子页签。"""
+        if not self._activity_source:
+            return
+        target = self.tab_pair if self._activity_source == "pair" else self.tab_watch
+        self._mode_group.button(1).setChecked(True)
+        self.stack.setCurrentIndex(1)
+        self.files_tabs.setCurrentWidget(target)
+        self.files_tabs.setFocus()
 
     def _on_files_tab_changed(self, index: int) -> None:
         if self.files_tabs.widget(index) is self.tab_history:
@@ -342,9 +383,11 @@ class MainWindow(QMainWindow):
         # 未选中硬盘时只显示居中占位，不渲染一堆空 tab
         self.placeholder = QLabel(
             '<div style="text-align:center;">'
-            f'<p style="font-size:17px; font-weight:600; color:{theme.TEXT_MUTED}; margin:0 0 8px 0;">未选择硬盘</p>'
+            f'<p style="font-size:17px; font-weight:600; color:{theme.TEXT_MUTED}; margin:0 0 10px 0;">未选择硬盘</p>'
+            f'<p style="font-size:12px; color:{theme.TEXT_FAINT}; margin:0 0 4px 0;">'
+            "在左侧选择一块硬盘查看数据</p>"
             f'<p style="font-size:12px; color:{theme.TEXT_FAINT}; margin:0;">'
-            "在左侧选择一块硬盘查看数据；列表为空时请先点【扫描硬盘】</p></div>"
+            "列表为空时，请先点【扫描硬盘】</p></div>"
         )
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setWordWrap(True)
@@ -541,6 +584,10 @@ class MainWindow(QMainWindow):
         self.attrs_hint.setObjectName("Faint")
         bar.addWidget(self.attrs_hint)
         bar.addStretch(1)
+        self.btn_export_attrs = QPushButton("导出 CSV")
+        self.btn_export_attrs.setToolTip("把当前快照的完整属性表导出成 CSV")
+        self.btn_export_attrs.clicked.connect(self._export_attrs_csv)
+        bar.addWidget(self.btn_export_attrs)
         layout.addLayout(bar)
 
         self.attrs_table = QTableWidget(0, 0)
@@ -638,18 +685,50 @@ class MainWindow(QMainWindow):
         self.metric_combo = QComboBox()
         self.metric_combo.currentIndexChanged.connect(self._redraw_trend)
         bar.addWidget(self.metric_combo)
+
+        bar.addSpacing(10)
+        bar.addWidget(QLabel("对比"))
+        self.metric_combo2 = QComboBox()
+        self.metric_combo2.setToolTip(
+            "在同一张图上叠加第二个指标（用右侧 Y 轴），方便看两个量之间的关系，\n"
+            "例如温度升高时寿命消耗是否加快。"
+        )
+        self.metric_combo2.currentIndexChanged.connect(self._redraw_trend)
+        bar.addWidget(self.metric_combo2)
         bar.addStretch(1)
+        self.trend_legend = QLabel("")
+        self.trend_legend.setObjectName("Faint")
+        bar.addWidget(self.trend_legend)
         self.trend_hint = QLabel("")
         self.trend_hint.setObjectName("Faint")
         bar.addWidget(self.trend_hint)
+        self.btn_export_trend = QPushButton("导出 CSV")
+        self.btn_export_trend.setToolTip("把这块硬盘的全部历史指标导出成 CSV，方便长期归档或做表格分析")
+        self.btn_export_trend.clicked.connect(self._export_history_csv)
+        bar.addWidget(self.btn_export_trend)
         layout.addLayout(bar)
 
         self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem(orientation="bottom")})
         self.plot.showGrid(x=False, y=True, alpha=0.15)
         self.plot.setMouseEnabled(x=True, y=False)
         self.plot.getAxis("left").setWidth(56)
+        self.plot.showAxis("right")
+        self.plot.getAxis("right").setWidth(56)
+        self.plot.getAxis("right").hide()
+        # 第二个指标画在独立的 ViewBox 里，共用 X 轴、各用一条 Y 轴
+        self._second_view = pg.ViewBox()
+        self.plot.scene().addItem(self._second_view)
+        self.plot.getAxis("right").linkToView(self._second_view)
+        self._second_view.setXLink(self.plot.getViewBox())
+        self.plot.getViewBox().sigResized.connect(self._sync_second_view)
         layout.addWidget(self.plot, 1)
         return page
+
+    def _sync_second_view(self) -> None:
+        self._second_view.setGeometry(self.plot.getViewBox().sceneBoundingRect())
+        self._second_view.linkedViewChanged(
+            self.plot.getViewBox(), self._second_view.XAxis
+        )
 
     def _build_report_tab(self) -> QWidget:
         page = QWidget()
@@ -663,6 +742,10 @@ class MainWindow(QMainWindow):
         self.report_hint.setObjectName("Faint")
         self.report_hint.setWordWrap(True)
         bar.addWidget(self.report_hint, 1)
+        self.btn_export_report = QPushButton("导出…")
+        self.btn_export_report.setToolTip("把这份报告存成 TXT 或 HTML 文件（HTML 可直接打开/打印）")
+        self.btn_export_report.clicked.connect(self._export_report)
+        bar.addWidget(self.btn_export_report, 0, Qt.AlignTop)
         self.btn_copy_report = QPushButton("复制报告")
         self.btn_copy_report.setToolTip("把整份报告复制成纯文本，方便存档或粘给别的工具")
         self.btn_copy_report.clicked.connect(self._copy_report)
@@ -679,6 +762,125 @@ class MainWindow(QMainWindow):
             return
         QApplication.clipboard().setText(self._last_report.text)
         self.statusBar().showMessage("报告已复制到剪贴板", 4000)
+
+    def _export_report(self) -> None:
+        if not self._last_report:
+            return
+        from PySide6.QtWidgets import QFileDialog
+
+        model = self.lbl_model.text().strip() or "硬盘"
+        default = str(
+            Path.home() / "Desktop"
+            / f"{_safe_filename(model)}-健康报告-{datetime.now().strftime('%Y%m%d')}.txt"
+        )
+        path, selected = QFileDialog.getSaveFileName(
+            self, "导出健康报告", default, "文本文件 (*.txt);;网页文件 (*.html)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith((".txt", ".html", ".htm")):
+            path += ".html" if "html" in (selected or "").lower() else ".txt"
+
+        html = path.lower().endswith((".html", ".htm"))
+        try:
+            Path(path).write_text(
+                self._last_report.html if html else self._last_report.text,
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写文件失败：{exc}")
+            return
+
+        self.statusBar().showMessage(f"报告已导出：{path}", 8000)
+        box = QMessageBox(self)
+        box.setWindowTitle("导出完成")
+        box.setIcon(QMessageBox.Information)
+        box.setText("报告已导出。")
+        box.setInformativeText(path)
+        open_btn = box.addButton("打开", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _ask_csv_path(self, suffix: str) -> str | None:
+        from PySide6.QtWidgets import QFileDialog
+
+        model = _safe_filename(self.lbl_model.text().strip() or "硬盘")
+        default = str(
+            Path.home() / "Desktop"
+            / f"{model}-{suffix}-{datetime.now().strftime('%Y%m%d')}.csv"
+        )
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "导出 CSV", default, "CSV 文件 (*.csv)"
+        )
+        if not path:
+            return None
+        return path if path.lower().endswith(".csv") else path + ".csv"
+
+    def _export_attrs_csv(self) -> None:
+        """导出当前快照的完整属性表（ATA 与 NVMe 都走表格内容，格式统一）。"""
+        if self.attrs_table.columnCount() == 0 or self.attrs_table.rowCount() == 0:
+            QMessageBox.information(self, "没有可导出的数据", "当前没有属性表可导出，请先做一次检测。")
+            return
+        path = self._ask_csv_path("属性表")
+        if not path:
+            return
+
+        headers = []
+        for column in range(self.attrs_table.columnCount()):
+            item = self.attrs_table.horizontalHeaderItem(column)
+            headers.append(item.text() if item else "")
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                for row in range(self.attrs_table.rowCount()):
+                    writer.writerow([
+                        (self.attrs_table.item(row, column).text()
+                         if self.attrs_table.item(row, column) else "")
+                        for column in range(self.attrs_table.columnCount())
+                    ])
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写文件失败：{exc}")
+            return
+        self.statusBar().showMessage(f"属性表已导出：{path}", 8000)
+
+    def _export_history_csv(self) -> None:
+        if not self.current_key:
+            return
+        history = self.store.history(self.current_key)
+        if not history:
+            QMessageBox.information(self, "没有可导出的数据", "这块硬盘还没有检测记录。")
+            return
+        path = self._ask_csv_path("指标历史")
+        if not path:
+            return
+
+        keys = [
+            key for key in normalize.METRIC_KEYS
+            if any(isinstance(row.get(key), (int, float)) for row in history)
+        ]
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    ["检测时间"]
+                    + [
+                        normalize.label_of(key)
+                        + (f" ({normalize.unit_of(key)})" if normalize.unit_of(key) else "")
+                        for key in keys
+                    ]
+                )
+                for row in history:
+                    writer.writerow(
+                        [str(row.get("timestamp") or "").replace("T", " ")]
+                        + [row.get(key, "") for key in keys]
+                    )
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写文件失败：{exc}")
+            return
+        self.statusBar().showMessage(f"指标历史已导出：{path}", 8000)
 
     def _build_raw_tab(self) -> QWidget:
         page = QWidget()
@@ -709,6 +911,21 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_status_widgets(self) -> None:
+        # 底部右侧：备份数据 / 回收站 / 数据目录。都是低频操作，放这里不占顶部空间。
+        self.btn_backup = QPushButton("备份数据")
+        self.btn_backup.setObjectName("LinkButton")
+        self.btn_backup.setCursor(Qt.PointingHandCursor)
+        self.btn_backup.setToolTip("把整个 data 目录打包成 zip，换电脑或重装前先备份一份")
+        self.btn_backup.clicked.connect(self._backup_data)
+        self.statusBar().addPermanentWidget(self.btn_backup)
+
+        self.btn_recycle = QPushButton("回收站")
+        self.btn_recycle.setObjectName("LinkButton")
+        self.btn_recycle.setCursor(Qt.PointingHandCursor)
+        self.btn_recycle.setToolTip("查看已移除的冷备对 / 自检目标，可恢复")
+        self.btn_recycle.clicked.connect(self._open_recycle_bin)
+        self.statusBar().addPermanentWidget(self.btn_recycle)
+
         # 「数据目录」不是功能按钮，放底部状态栏，做成蓝色文字链接
         self.btn_dir = QPushButton("数据目录")
         self.btn_dir.setObjectName("LinkButton")
@@ -721,19 +938,98 @@ class MainWindow(QMainWindow):
         self.lbl_smartctl.setObjectName("Faint")
         self.statusBar().addPermanentWidget(self.lbl_smartctl)
 
+        self._refresh_recycle_badge()
+
+    def _recycle_count(self) -> int:
+        try:
+            return (len(self.tab_pair.store.deleted_pairs())
+                    + len(self.tab_watch.watch.deleted_targets()))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _refresh_recycle_badge(self) -> None:
+        count = self._recycle_count()
+        self.btn_recycle.setText(f"回收站 ({count})" if count else "回收站")
+
+    def _open_recycle_bin(self) -> None:
+        dialog = RecycleBinDialog(self.tab_pair.store, self.tab_watch.watch, self)
+        dialog.changed.connect(self._after_recycle_changed)
+        dialog.exec()
+        self._refresh_recycle_badge()
+
+    def _after_recycle_changed(self) -> None:
+        # 恢复/彻底删除都会改变列表，三个页签都重新从库里读一遍
+        self._refresh_recycle_badge()
+        self.tab_pair._reload()
+        self.tab_watch._reload()
+        self.tab_history.refresh()
+        self.statusBar().showMessage("回收站已更新", 4000)
+
+    def _backup_data(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        default = str(Path.home() / "Desktop" / backup.default_backup_name())
+        target, _filter = QFileDialog.getSaveFileName(
+            self, "备份数据到…", default, "Zip 压缩包 (*.zip)"
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".zip"):
+            target += ".zip"
+
+        self.btn_backup.setEnabled(False)
+        self.statusBar().showMessage("正在打包数据…")
+        worker = Worker(lambda: backup.backup_data(target), self)
+        worker.succeeded.connect(lambda result: self._backup_done(target, result))
+        worker.failed.connect(self._backup_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._backup_worker = worker
+        worker.start()
+
+    def _backup_done(self, target: str, result: tuple[int, int]) -> None:
+        self.btn_backup.setEnabled(True)
+        files, size = result
+        self.statusBar().showMessage(f"已备份 {files:,} 个文件", 8000)
+        box = QMessageBox(self)
+        box.setWindowTitle("备份完成")
+        box.setIcon(QMessageBox.Information)
+        box.setText("数据已备份完成。")
+        box.setInformativeText(
+            f"{target}\n{files:,} 个文件，约 {_format_bytes(size)}\n\n"
+            "恢复方式：关闭本软件，把压缩包里的 data 目录解压回项目根目录即可。"
+        )
+        open_btn = box.addButton("打开所在文件夹", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(target).parent)))
+
+    def _backup_failed(self, message: str) -> None:
+        self.btn_backup.setEnabled(True)
+        self.statusBar().showMessage("备份失败", 5000)
+        QMessageBox.warning(self, "备份失败", message)
+
     # ------------------------------------------------------------------ #
     # 状态
     # ------------------------------------------------------------------ #
     def _update_status_bar(self) -> None:
-        parts: list[str] = []
+        """状态栏只留一句话摘要，完整路径等细节进 tooltip。"""
+        text_parts: list[str] = []
+        tip_parts: list[str] = []
         try:
             path = collector.find_smartctl()
-            parts.append(f"smartctl {collector.smartctl_version()}  ·  {path}")
+            text_parts.append(f"smartctl {collector.smartctl_version()}")
+            tip_parts.append(f"smartctl 路径：{path}")
         except CollectError:
-            parts.append("未找到 smartctl")
+            text_parts.append("未找到 smartctl")
         if not is_admin():
-            parts.append("非管理员（错误日志/自检日志可能读取不到）")
-        self.lbl_smartctl.setText("    ".join(parts))
+            text_parts.append("非管理员模式")
+            tip_parts.append(
+                "非管理员运行时错误日志/自检日志可能读取不到。"
+                "需要完整数据时用 run_as_admin.bat 启动。"
+            )
+        self.lbl_smartctl.setText("   ·   ".join(text_parts))
+        self.lbl_smartctl.setToolTip("\n".join(tip_parts))
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self._busy = busy
@@ -1359,13 +1655,23 @@ class MainWindow(QMainWindow):
             and any(isinstance(row.get(key), (int, float)) for row in history)
         ]
         previous_selection = self.metric_combo.currentData()
-        self.metric_combo.blockSignals(True)
+        previous_second = self.metric_combo2.currentData()
+        for combo in (self.metric_combo, self.metric_combo2):
+            combo.blockSignals(True)
         self.metric_combo.clear()
         for key in keys:
             self.metric_combo.addItem(normalize.label_of(key), key)
         if previous_selection in keys:
             self.metric_combo.setCurrentIndex(keys.index(previous_selection))
-        self.metric_combo.blockSignals(False)
+
+        self.metric_combo2.clear()
+        self.metric_combo2.addItem("（不叠加）", None)
+        for key in keys:
+            self.metric_combo2.addItem(normalize.label_of(key), key)
+        if previous_second in keys:
+            self.metric_combo2.setCurrentIndex(keys.index(previous_second) + 1)
+        for combo in (self.metric_combo, self.metric_combo2):
+            combo.blockSignals(False)
         self._redraw_trend()
 
     def _fill_snapshot_combo(self, key: str) -> None:
@@ -1385,43 +1691,59 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _redraw_trend(self) -> None:
         self.plot.clear()
+        self._second_view.clear()
+        self.plot.getAxis("right").hide()
+        self.trend_legend.setText("")
         key = self.metric_combo.currentData()
         if not key or not self.current_key:
             self.trend_hint.setText("")
             return
 
         history = self.store.history(self.current_key)
-        points: list[tuple[float, float]] = []
-        for row in history:
-            value = row.get(key)
-            if not isinstance(value, (int, float)):
-                continue
-            try:
-                stamp = datetime.fromisoformat(str(row.get("timestamp"))).timestamp()
-            except ValueError:
-                continue
-            points.append((stamp, float(value)))
-
+        points = _points_for(history, key)
         if len(points) < 2:
             self.trend_hint.setText("至少需要 2 次检测才能画出趋势")
             return
 
-        self.trend_hint.setText(f"共 {len(points)} 个数据点")
-        xs = [p[0] for p in points]
-        ys = [p[1] for p in points]
-        pen = pg.mkPen(theme.ACCENT, width=2)
         self.plot.plot(
-            xs,
-            ys,
-            pen=pen,
+            [p[0] for p in points],
+            [p[1] for p in points],
+            pen=pg.mkPen(theme.ACCENT, width=2),
             symbol="o",
             symbolSize=6,
             symbolBrush=theme.ACCENT,
             symbolPen=pg.mkPen("#ffffff", width=1),
         )
-        unit = normalize.unit_of(key)
-        self.plot.setLabel("left", normalize.label_of(key), units=unit or None)
+        self.plot.setLabel("left", normalize.label_of(key), units=normalize.unit_of(key) or None)
+
+        key2 = self.metric_combo2.currentData()
+        points2 = _points_for(history, key2) if key2 and key2 != key else []
+        if len(points2) >= 2:
+            secondary = "#d97706"
+            curve = pg.PlotCurveItem(
+                [p[0] for p in points2],
+                [p[1] for p in points2],
+                pen=pg.mkPen(secondary, width=2, style=Qt.DashLine),
+                symbol="t",
+                symbolSize=6,
+                symbolBrush=secondary,
+                symbolPen=pg.mkPen("#ffffff", width=1),
+            )
+            self._second_view.addItem(curve)
+            self._second_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+            self.plot.getAxis("right").show()
+            self.plot.setLabel(
+                "right", normalize.label_of(key2), units=normalize.unit_of(key2) or None
+            )
+            self.plot.getAxis("right").setPen(pg.mkPen(secondary))
+            self.plot.getAxis("right").setTextPen(pg.mkPen(secondary))
+            self.trend_legend.setText(
+                f'<span style="color:{theme.ACCENT};">● {normalize.label_of(key)}（左轴）</span>'
+                f'&nbsp;&nbsp;<span style="color:{secondary};">▲ {normalize.label_of(key2)}（右轴）</span>'
+            )
+
         self.plot.enableAutoRange()
+        self.trend_hint.setText(f"共 {len(points)} 个数据点")
 
     def _redraw_raw(self) -> None:
         snapshot_id = self.snapshot_combo.currentData()
@@ -1505,3 +1827,26 @@ def _format_snapshot_id(snapshot_id: str) -> str:
     except ValueError:
         return snapshot_id
     return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _safe_filename(text: str) -> str:
+    """去掉 Windows 文件名不允许的字符，避免保存对话框里报错。"""
+    cleaned = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in text)
+    return cleaned.strip().strip(".") or "硬盘"
+
+
+def _points_for(history: list[dict[str, Any]], key: str) -> list[tuple[float, float]]:
+    """把某指标的历史取值转成 (时间戳, 值) 序列，跳过缺失/非数值的点。"""
+    out: list[tuple[float, float]] = []
+    if not key:
+        return out
+    for row in history:
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(row.get("timestamp"))).timestamp()
+        except ValueError:
+            continue
+        out.append((stamp, float(value)))
+    return out

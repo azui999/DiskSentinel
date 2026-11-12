@@ -108,7 +108,8 @@ CREATE TABLE IF NOT EXISTS watch_targets (
     name            TEXT NOT NULL,
     path            TEXT NOT NULL UNIQUE,
     created         TEXT NOT NULL,
-    baseline_run_id INTEGER
+    baseline_run_id INTEGER,
+    deleted_at      TEXT NOT NULL DEFAULT ''   -- 非空 = 已移入回收站（软删除）
 );
 CREATE TABLE IF NOT EXISTS watch_runs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,6 +145,8 @@ CREATE TABLE IF NOT EXISTS watch_files (
 def ensure_schema(store: PairStore) -> None:
     with store.connect() as conn:
         conn.executescript(_SCHEMA)
+    # 老库/新库统一补上软删除列（回收站功能依赖）
+    store.ensure_soft_delete()
 
 
 # --------------------------------------------------------------------------- #
@@ -161,13 +164,30 @@ class WatchStore:
         return self.store.connect()
 
     def targets(self) -> list[WatchTarget]:
+        """未删除的自检目标（回收站里的不算）。"""
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT id, name, path, created, baseline_run_id"
-                " FROM watch_targets ORDER BY id"
+                " FROM watch_targets WHERE deleted_at='' ORDER BY id"
             ).fetchall()
         return [
             WatchTarget(r["id"], r["name"], r["path"], r["created"], r["baseline_run_id"])
+            for r in rows
+        ]
+
+    def deleted_targets(self) -> list[tuple[WatchTarget, str]]:
+        """回收站里的自检目标：(目标, 删除时间)。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, path, created, baseline_run_id, deleted_at"
+                " FROM watch_targets WHERE deleted_at<>''"
+                " ORDER BY deleted_at DESC, id DESC"
+            ).fetchall()
+        return [
+            (
+                WatchTarget(r["id"], r["name"], r["path"], r["created"], r["baseline_run_id"]),
+                r["deleted_at"],
+            )
             for r in rows
         ]
 
@@ -177,21 +197,63 @@ class WatchStore:
         absolute = os.path.abspath(path)
         with self.connect() as conn:
             exists = conn.execute(
-                "SELECT id FROM watch_targets WHERE path=? COLLATE NOCASE", (absolute,)
+                "SELECT id FROM watch_targets WHERE path=? COLLATE NOCASE AND deleted_at=''",
+                (absolute,),
             ).fetchone()
             if exists:
                 raise PairError(f"这个路径已经添加过了：{absolute}")
-            count = conn.execute("SELECT COUNT(*) c FROM watch_targets").fetchone()["c"]
+            # path 有 UNIQUE 约束：回收站里可能有同路径的软删除行，
+            # 直接复用那一行（历史记录也一起回来），避免撞唯一索引
+            recycled = conn.execute(
+                "SELECT id FROM watch_targets WHERE path=? COLLATE NOCASE AND deleted_at<>''",
+                (absolute,),
+            ).fetchone()
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM watch_targets WHERE deleted_at=''"
+            ).fetchone()["c"]
+            display_name = name.strip() or f"自检目标 {count + 1}"
+            if recycled:
+                conn.execute(
+                    "UPDATE watch_targets SET deleted_at='', name=? WHERE id=?",
+                    (display_name, int(recycled["id"])),
+                )
+                row = conn.execute(
+                    "SELECT id, name, path, created, baseline_run_id"
+                    " FROM watch_targets WHERE id=?",
+                    (int(recycled["id"]),),
+                ).fetchone()
+                return WatchTarget(row["id"], row["name"], row["path"],
+                                   row["created"], row["baseline_run_id"])
             cur = conn.execute(
                 "INSERT INTO watch_targets(name, path, created) VALUES(?,?,?)",
-                (name.strip() or f"自检目标 {count + 1}", absolute,
-                 time.strftime("%Y-%m-%d %H:%M:%S")),
+                (display_name, absolute, time.strftime("%Y-%m-%d %H:%M:%S")),
             )
             target_id = int(cur.lastrowid or 0)
-        return WatchTarget(target_id, name.strip() or f"自检目标 {count + 1}",
+        return WatchTarget(target_id, display_name,
                            absolute, time.strftime("%Y-%m-%d %H:%M:%S"), None)
 
     def remove(self, target_id: int) -> None:
+        """移入回收站（软删除）。基线与历次复检结果原样保留，可恢复。"""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE watch_targets SET deleted_at=? WHERE id=? AND deleted_at=''",
+                (stamp, int(target_id)),
+            )
+            if not cur.rowcount:
+                raise PairError("没有找到这个自检目标（可能已被删除）")
+
+    def restore(self, target_id: int) -> None:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE watch_targets SET deleted_at='' WHERE id=? AND deleted_at<>''",
+                (int(target_id),),
+            )
+            if not cur.rowcount:
+                raise PairError("没有找到这个可恢复的自检目标")
+
+    def purge(self, target_id: int) -> None:
+        """彻底删除目标及其全部自检记录（基线 + 历次复检）。"""
         with self.connect() as conn:
             conn.execute(
                 "DELETE FROM watch_files WHERE run_id IN"
@@ -234,6 +296,19 @@ class WatchStore:
             "reused_files": row["reused_files"],
             "seconds": row["seconds"],
         }
+
+    def recent_checks(self, target_id: int, limit: int = 2) -> list[dict[str, Any]]:
+        """最近几次完成的复检（不含建立基线那次），用于"与上次对比"。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, finished, started FROM watch_runs"
+                " WHERE target_id=? AND status='finished' AND kind='check'"
+                " ORDER BY id DESC LIMIT ?",
+                (int(target_id), int(limit)),
+            ).fetchall()
+        return [
+            {"run_id": r["id"], "timestamp": r["finished"] or r["started"]} for r in rows
+        ]
 
     def history(self, target_id: int, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -545,7 +620,7 @@ def all_runs(store: PairStore, limit: int = 200) -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT wr.*, wt.name AS target_name FROM watch_runs wr"
             " JOIN watch_targets wt ON wt.id = wr.target_id"
-            " ORDER BY wr.id DESC LIMIT ?",
+            " WHERE wt.deleted_at='' ORDER BY wr.id DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
     out = []

@@ -349,3 +349,66 @@ def advice(node: FileNode) -> str:
     if node.issue == "new":
         return "基线建立之后新增的文件，属正常变动；下次复检会自动纳入比对。"
     return ""
+
+
+# --------------------------------------------------------------------------- #
+# 两次运行的对比：本次新出现的问题 / 上次有但这次没有了的
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Change:
+    """两次运行之间的问题变化。kind: new=本次新出现, fixed=本次不再有问题。"""
+
+    path: str
+    issue: str
+    previous_issue: str = ""
+    kind: str = "new"
+
+    @property
+    def issue_text(self) -> str:
+        if self.kind == "new" and self.previous_issue:
+            return f"{CAT_TEXT.get(self.previous_issue, self.previous_issue)} → {CAT_TEXT.get(self.issue, self.issue)}"
+        return CAT_TEXT.get(self.issue, self.issue)
+
+    @property
+    def severity(self) -> int:
+        return SEVERITY.get(self.issue, 0)
+
+
+def problem_map(root: DirNode | None) -> dict[str, str]:
+    """path -> issue，只收有问题（issue 非空）的文件。"""
+    out: dict[str, str] = {}
+    if root is None:
+        return out
+
+    def walk(node: DirNode) -> None:
+        for child in node.dirs.values():
+            walk(child)
+        for fnode in node.files.values():
+            if fnode.issue:
+                out[fnode.path] = fnode.issue
+
+    walk(root)
+    return out
+
+
+def diff_problems(old: DirNode | None, new: DirNode | None) -> list[Change]:
+    """对比两次运行的问题集合。
+
+    同一个路径上问题类型变严重（例如"时间不同"变成"内容不同"）也算新问题，
+    因为这是用户最需要看到的升级信号。
+    """
+    before = problem_map(old)
+    after = problem_map(new)
+    changes: list[Change] = []
+    for path, issue in after.items():
+        previous = before.get(path)
+        if previous is None:
+            changes.append(Change(path, issue, "", "new"))
+        elif previous != issue:
+            changes.append(Change(path, issue, previous, "new"))
+    for path, issue in before.items():
+        if path not in after:
+            changes.append(Change(path, issue, "", "fixed"))
+    changes.sort(key=lambda c: (c.kind != "new", -c.severity, c.path))
+    return changes

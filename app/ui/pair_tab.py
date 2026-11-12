@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +29,7 @@ from .. import difftree, pairing, verify
 from ..pairing import CompareResult, Pair, PairStore
 from ..verify import VerifyResult
 from . import theme
+from .changes_dialog import ChangesDialog
 from .common import CountCard, TaskWorker, fmt_size as _fmt_size
 from .diff_trees import DiffTrees
 
@@ -126,11 +127,15 @@ class NewPairDialog(QDialog):
 
 
 class PairTab(QWidget):
+    # 长任务状态广播给主窗口（顶栏的"校验进行中"指示），空串表示空闲
+    activity = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.store = PairStore()
         self._worker: VerifyWorker | None = None
         self._busy = False
+        self._activity_text = "正在处理…"
         self._pairs: list[Pair] = []
         self._build_ui()
         self._reload()
@@ -155,7 +160,8 @@ class PairTab(QWidget):
         self.btn_new = QPushButton("新建冷备对")
         self.btn_new.clicked.connect(self.on_new)
         top.addWidget(self.btn_new)
-        self.btn_remove = QPushButton("删除")
+        self.btn_remove = QPushButton("移除")
+        self.btn_remove.setToolTip("移到回收站（保留比对历史，可恢复）")
         self.btn_remove.clicked.connect(self.on_remove)
         top.addWidget(self.btn_remove)
         self.btn_compare = QPushButton("结构比对")
@@ -175,25 +181,57 @@ class PairTab(QWidget):
         )
         self.btn_verify.clicked.connect(self.on_verify)
         top.addWidget(self.btn_verify)
+        self.btn_changes = QPushButton("与上次对比")
+        self.btn_changes.setToolTip(
+            "把最近两次运行的问题文件对比一下：哪些是这次新坏的、哪些已经修好了。\n"
+            "与页面上正在看的树用同一数据来源（优先内容校验，否则结构比对）。"
+        )
+        self.btn_changes.clicked.connect(self.on_compare_with_last)
+        top.addWidget(self.btn_changes)
         layout.addLayout(top)
 
         # 信息卡
         self.info_card = QFrame()
         self.info_card.setObjectName("Card")
         info_layout = QVBoxLayout(self.info_card)
-        info_layout.setContentsMargins(14, 10, 14, 10)
-        info_layout.setSpacing(4)
+        info_layout.setContentsMargins(16, 12, 16, 12)
+        info_layout.setSpacing(6)
         self.lbl_pair_name = QLabel("未选择冷备对")
         self.lbl_pair_name.setStyleSheet("font-size:15px; font-weight:600;")
-        self.lbl_path_a = QLabel("A：—")
+
+        def side_badge(letter: str) -> QLabel:
+            badge = QLabel(letter)
+            badge.setFixedSize(22, 22)
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setStyleSheet(
+                f"background:{theme.ACCENT_SOFT}; color:{theme.ACCENT};"
+                "border-radius:6px; font-weight:600; font-size:11px;"
+            )
+            return badge
+
+        self.lbl_path_a = QLabel("—")
+        self.lbl_path_b = QLabel("—")
         self.lbl_path_a.setObjectName("Muted")
-        self.lbl_path_b = QLabel("B：—")
         self.lbl_path_b.setObjectName("Muted")
+        for lbl in (self.lbl_path_a, self.lbl_path_b):
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        def path_row(letter: str, label: QLabel) -> QWidget:
+            row = QFrame()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            row_layout.addWidget(side_badge(letter))
+            row_layout.addWidget(label, 1)
+            return row
+
+        self.row_a = path_row("A", self.lbl_path_a)
+        self.row_b = path_row("B", self.lbl_path_b)
         self.lbl_last = QLabel("尚未比对过")
         self.lbl_last.setObjectName("Faint")
         info_layout.addWidget(self.lbl_pair_name)
-        info_layout.addWidget(self.lbl_path_a)
-        info_layout.addWidget(self.lbl_path_b)
+        info_layout.addWidget(self.row_a)
+        info_layout.addWidget(self.row_b)
         info_layout.addWidget(self.lbl_last)
         layout.addWidget(self.info_card)
 
@@ -275,6 +313,7 @@ class PairTab(QWidget):
         self.btn_remove.setEnabled(has and not self._busy)
         self.btn_compare.setEnabled(has and not self._busy)
         self.btn_verify.setEnabled(has and not self._busy)
+        self.btn_changes.setEnabled(has and not self._busy)
         self.empty_hint.setVisible(not has)
         self.diff_view.setVisible(has)
         if not has:
@@ -301,8 +340,8 @@ class PairTab(QWidget):
         if pair is None:
             return
         self.lbl_pair_name.setText(pair.name)
-        self.lbl_path_a.setText(f"A：{pair.path_a}")
-        self.lbl_path_b.setText(f"B：{pair.path_b}")
+        self.lbl_path_a.setText(pair.path_a)
+        self.lbl_path_b.setText(pair.path_b)
         self._render_last_run()
         self._render_stored_cards(pair)
         self._load_tree(pair)
@@ -402,14 +441,14 @@ class PairTab(QWidget):
         if pair is None:
             return
         box = QMessageBox(self)
-        box.setWindowTitle("删除冷备对")
+        box.setWindowTitle("移除冷备对")
         box.setIcon(QMessageBox.Question)
-        box.setText(f"确定删除「{pair.name}」吗？")
+        box.setText(f"把「{pair.name}」移到回收站？")
         box.setInformativeText(
-            "只删除软件里的配对关系和比对历史，不影响两块硬盘上的任何文件；"
-            "需要时随时可以重新创建。"
+            "配对关系和比对历史都会保留，可在底部状态栏的【回收站】里恢复。\n"
+            "两块硬盘上的文件不会有任何改动。"
         )
-        confirm = box.addButton("删除", QMessageBox.AcceptRole)
+        confirm = box.addButton("移到回收站", QMessageBox.AcceptRole)
         box.addButton("取消", QMessageBox.RejectRole)
         box.setDefaultButton(confirm)
         box.exec()
@@ -421,6 +460,53 @@ class PairTab(QWidget):
             self._warn(str(exc))
             return
         self._reload()
+
+    # -- 与上次对比 ------------------------------------------------------- #
+    def on_compare_with_last(self) -> None:
+        pair = self.current_pair()
+        if pair is None:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        error = ""
+        try:
+            # 数据来源与页面上正在看的树保持一致
+            if verify.last_verify(self.store, pair.id):
+                runs = verify.recent_runs(self.store, pair.id, 2)
+                source_text = "内容校验"
+                load = lambda rid: difftree.load_verify(self.store, rid)  # noqa: E731
+            else:
+                runs = self.store.recent_runs(pair.id, 2)
+                source_text = "结构比对"
+                load = lambda rid: difftree.load_compare(self.store, rid)  # noqa: E731
+            new_root = old_root = None
+            if len(runs) >= 2:
+                new_root = load(runs[0]["run_id"])
+                old_root = load(runs[1]["run_id"])
+        except Exception as exc:  # noqa: BLE001 - 库损坏时给提示，不崩
+            error = str(exc)
+            runs, source_text = [], ""
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if error:
+            self._warn(f"读取历史记录失败：{error}")
+            return
+        if len(runs) < 2:
+            QMessageBox.information(
+                self,
+                "还没有可对比的记录",
+                f"这个冷备对目前只有 {len(runs)} 次{source_text}记录。\n"
+                "再跑一次之后，就能看出哪些文件是新出现的问题。",
+            )
+            return
+
+        changes = difftree.diff_problems(old_root, new_root)
+        ChangesDialog(
+            changes,
+            f"本次（{runs[0]['timestamp']}）",
+            f"上次（{runs[1]['timestamp']}）",
+            self,
+        ).exec()
 
     # -- 结构比对 --------------------------------------------------------- #
     def on_compare(self) -> None:
@@ -453,6 +539,7 @@ class PairTab(QWidget):
         if box.clickedButton() is not confirm:
             return
 
+        self._activity_text = "结构比对中…"
         self._set_busy(True)
         self.status_label.setText("正在准备…")
         worker = VerifyWorker(
@@ -513,6 +600,7 @@ class PairTab(QWidget):
             return
         incremental = quick.isChecked()
 
+        self._activity_text = "内容校验 0%"
         self._set_busy(True)
         self.progress_box.show()
         self.progress_bar.setValue(0)
@@ -544,6 +632,7 @@ class PairTab(QWidget):
             done = info.get("bytes") or 0
             ratio = done / total if total else 0
             self.progress_bar.setValue(int(ratio * 1000))
+            self.activity.emit(f"内容校验 {int(ratio * 100)}%")
             side = "A" if info.get("side") == "a" else "B"
             rate = info.get("rate") or 0
             eta = info.get("eta") or 0
@@ -603,9 +692,11 @@ class PairTab(QWidget):
         self._busy = busy
         self.btn_compare.setEnabled(not busy)
         self.btn_verify.setEnabled(not busy)
+        self.btn_changes.setEnabled(not busy)
         self.btn_new.setEnabled(not busy)
         self.btn_remove.setEnabled(not busy)
         self.pair_combo.setEnabled(not busy)
+        self.activity.emit(self._activity_text if busy else "")
 
     # ------------------------------------------------------------------ #
     # 结果渲染

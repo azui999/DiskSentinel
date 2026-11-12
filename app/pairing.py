@@ -105,11 +105,12 @@ def _fmt_ts(mtime_ns: int) -> str:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pairs (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    name     TEXT NOT NULL,
-    path_a   TEXT NOT NULL,
-    path_b   TEXT NOT NULL,
-    created  TEXT NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    path_a     TEXT NOT NULL,
+    path_b     TEXT NOT NULL,
+    created    TEXT NOT NULL,
+    deleted_at TEXT NOT NULL DEFAULT ''   -- 非空 = 已移入回收站（软删除）
 );
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,6 +167,22 @@ class PairStore:
     def _init_db(self) -> None:
         with self.connect() as conn:
             conn.executescript(_SCHEMA)
+            # 老库补列：软删除标记（回收站）。表已存在时 CREATE TABLE 不会改动结构。
+            self._ensure_column(conn, "pairs", "deleted_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "watch_targets", "deleted_at", "TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+        try:
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            return
+        if columns and column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def ensure_soft_delete(self) -> None:
+        """供其他模块（watch/verify）在直接用连接前确保列存在。"""
+        self._init_db()
 
     def _import_legacy_pairs(self) -> None:
         """旧版 pairs.json（TSV 时代）一次性导入：只搬配对定义，历史 run 不搬。"""
@@ -194,11 +211,25 @@ class PairStore:
 
     # -- 盘对 CRUD -------------------------------------------------------- #
     def pairs(self) -> list[Pair]:
+        """未删除的冷备对（回收站里的不算）。"""
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, path_a, path_b, created FROM pairs ORDER BY id"
+                "SELECT id, name, path_a, path_b, created FROM pairs"
+                " WHERE deleted_at='' ORDER BY id"
             ).fetchall()
         return [Pair(r["id"], r["name"], r["path_a"], r["path_b"], r["created"]) for r in rows]
+
+    def deleted_pairs(self) -> list[tuple[Pair, str]]:
+        """回收站里的冷备对：(配对, 删除时间)。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, path_a, path_b, created, deleted_at FROM pairs"
+                " WHERE deleted_at<>'' ORDER BY deleted_at DESC, id DESC"
+            ).fetchall()
+        return [
+            (Pair(r["id"], r["name"], r["path_a"], r["path_b"], r["created"]), r["deleted_at"])
+            for r in rows
+        ]
 
     def add(self, name: str, path_a: str, path_b: str) -> Pair:
         if not os.path.isdir(path_a):
@@ -225,7 +256,30 @@ class PairStore:
         return pair
 
     def remove(self, pair_id: int) -> None:
-        """删除配对关系；该对的历史比对记录一并清理（diffs/manifests/runs）。"""
+        """移入回收站（软删除）。比对历史原样保留，可从回收站恢复。"""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE pairs SET deleted_at=? WHERE id=? AND deleted_at=''",
+                (stamp, int(pair_id)),
+            )
+            if not cur.rowcount:
+                raise PairError("没有找到这个冷备对（可能已被删除）")
+
+    def restore(self, pair_id: int) -> None:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE pairs SET deleted_at='' WHERE id=? AND deleted_at<>''",
+                (int(pair_id),),
+            )
+            if not cur.rowcount:
+                raise PairError("没有找到这个可恢复的冷备对")
+
+    def purge(self, pair_id: int) -> None:
+        """彻底删除配对关系及其全部历史（diffs / manifests / runs / verify 记录）。"""
+        from . import verify  # 避免循环导入
+
+        verify.ensure_schema(self)
         with self.connect() as conn:
             conn.execute(
                 "DELETE FROM diffs WHERE run_id IN (SELECT id FROM runs WHERE pair_id=?)",
@@ -236,6 +290,11 @@ class PairStore:
                 (int(pair_id),),
             )
             conn.execute("DELETE FROM runs WHERE pair_id=?", (int(pair_id),))
+            conn.execute(
+                "DELETE FROM verify_files WHERE verify_run_id IN"
+                " (SELECT id FROM verify_runs WHERE pair_id=?)", (int(pair_id),),
+            )
+            conn.execute("DELETE FROM verify_runs WHERE pair_id=?", (int(pair_id),))
             cur = conn.execute("DELETE FROM pairs WHERE id=?", (int(pair_id),))
             if not cur.rowcount:
                 raise PairError("没有找到这个冷备对")
@@ -261,6 +320,48 @@ class PairStore:
             "files_b": row["files_b"],
             "counts": counts,
         }
+
+    def recent_runs(self, pair_id: int, limit: int = 2) -> list[dict[str, Any]]:
+        """最近几次完成的结构比对（新→旧），用于"与上次对比"。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, timestamp FROM runs"
+                " WHERE pair_id=? AND finished=1 ORDER BY id DESC LIMIT ?",
+                (int(pair_id), int(limit)),
+            ).fetchall()
+        return [{"run_id": r["id"], "timestamp": r["timestamp"]} for r in rows]
+
+    def all_runs(self, limit: int = 200) -> list[dict[str, Any]]:
+        """全部结构比对记录（校验历史页用），按时间倒序。"""
+        self._init_db()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT r.*, p.name AS pair_name FROM runs r"
+                " JOIN pairs p ON p.id = r.pair_id"
+                " WHERE r.finished=1 AND p.deleted_at=''"
+                " ORDER BY r.id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        out = []
+        for row in rows:
+            try:
+                counts = json.loads(row["counts_json"])
+            except ValueError:
+                counts = {}
+            out.append({
+                "source": "pair",
+                "kind": "compare",
+                "status": "finished",
+                "run_id": row["id"],
+                "pair_id": row["pair_id"],
+                "title": row["pair_name"],
+                "started": row["timestamp"],
+                "finished": row["timestamp"],
+                "counts": counts,
+                "files": max(row["files_a"], row["files_b"]),
+                "seconds": row["scan_seconds"],
+            })
+        return out
 
 
 # --------------------------------------------------------------------------- #

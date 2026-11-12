@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
 
 from .. import verify
@@ -25,20 +25,18 @@ def fmt_size(size: int) -> str:
 
 
 class CountCard(QFrame):
-    """统计卡：大数字 + 小标题。"""
+    """统计卡：小标题在上、大数字在下，左对齐（与健康页 StatCard 同一款式）。"""
 
     def __init__(self, title: str, hint: str = "") -> None:
         super().__init__()
         self.setObjectName("Card")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(3)
         self.value_label = QLabel("—")
-        self.value_label.setStyleSheet("font-size:18px; font-weight:600;")
-        self.value_label.setAlignment(Qt.AlignCenter)
+        self.value_label.setObjectName("CardValue")
         title_label = QLabel(title)
         title_label.setObjectName("CardTitle")
-        title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.value_label)
         layout.addWidget(title_label)
         if hint:
@@ -46,9 +44,8 @@ class CountCard(QFrame):
 
     def set_value(self, text: str, color: str | None = None) -> None:
         self.value_label.setText(text)
-        self.value_label.setStyleSheet(
-            f"font-size:18px; font-weight:600; color:{color or theme.TEXT};"
-        )
+        # 只覆盖颜色，字号/字重仍由 QSS 的 CardValue 提供
+        self.value_label.setStyleSheet(f"color:{color or theme.TEXT};")
 
 
 class TaskWorker(QThread):

@@ -134,6 +134,7 @@ def ensure_schema(store: PairStore) -> None:
             conn.execute(
                 "ALTER TABLE verify_runs ADD COLUMN incremental INTEGER NOT NULL DEFAULT 0"
             )
+    store.ensure_soft_delete()
 
 
 # --------------------------------------------------------------------------- #
@@ -485,6 +486,20 @@ def last_verify(store: PairStore, pair_id: int) -> dict[str, Any] | None:
     }
 
 
+def recent_runs(store: PairStore, pair_id: int, limit: int = 2) -> list[dict[str, Any]]:
+    """最近几次完成的内容校验（新→旧），用于"与上次对比"。"""
+    ensure_schema(store)
+    with store.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, started, finished FROM verify_runs"
+            " WHERE pair_id=? AND status='finished' ORDER BY id DESC LIMIT ?",
+            (int(pair_id), int(limit)),
+        ).fetchall()
+    return [
+        {"run_id": r["id"], "timestamp": r["finished"] or r["started"]} for r in rows
+    ]
+
+
 def run_rows(store: PairStore, run_id: int) -> list[dict[str, Any]]:
     """事后重算某次内容校验的差异明细（历史报告用）。只读数据库，不碰磁盘。"""
     result = VerifyResult()
@@ -499,7 +514,8 @@ def all_runs(store: PairStore, limit: int = 200) -> list[dict[str, Any]]:
     with store.connect() as conn:
         rows = conn.execute(
             "SELECT vr.*, p.name AS pair_name FROM verify_runs vr"
-            " JOIN pairs p ON p.id = vr.pair_id ORDER BY vr.id DESC LIMIT ?",
+            " JOIN pairs p ON p.id = vr.pair_id"
+            " WHERE p.deleted_at='' ORDER BY vr.id DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
     out = []

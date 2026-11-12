@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
 from .. import difftree, watch
 from ..pairing import PairError, PairStore
 from . import theme
+from .changes_dialog import ChangesDialog
 from .common import CountCard, TaskWorker, fmt_size
 from .diff_trees import TreePanel
 
@@ -111,12 +113,17 @@ class NewTargetDialog(QDialog):
 
 
 class WatchTab(QWidget):
+    # 长任务状态广播给主窗口（顶栏的"校验进行中"指示），空串表示空闲
+    activity = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
         self.store = PairStore()
         self.watch = watch.WatchStore(self.store)
         self._worker: TaskWorker | None = None
         self._busy = False
+        self._activity_text = "正在复检…"
+        self._activity_prefix = "单盘复检"
         self._targets: list[watch.WatchTarget] = []
         self._build_ui()
         self._reload()
@@ -142,7 +149,8 @@ class WatchTab(QWidget):
         self.btn_new = QPushButton("新建自检目标")
         self.btn_new.clicked.connect(self.on_new)
         top.addWidget(self.btn_new)
-        self.btn_remove = QPushButton("删除")
+        self.btn_remove = QPushButton("移除")
+        self.btn_remove.setToolTip("移到回收站（保留基线与复检历史，可恢复）")
         self.btn_remove.clicked.connect(self.on_remove)
         top.addWidget(self.btn_remove)
         self.btn_reset = QPushButton("重建基线")
@@ -161,13 +169,19 @@ class WatchTab(QWidget):
         )
         self.btn_check.clicked.connect(self.on_check)
         top.addWidget(self.btn_check)
+        self.btn_changes = QPushButton("与上次对比")
+        self.btn_changes.setToolTip(
+            "把最近两次复检的问题文件对比一下：哪些是这次新坏的、哪些已经修好了。"
+        )
+        self.btn_changes.clicked.connect(self.on_compare_with_last)
+        top.addWidget(self.btn_changes)
         layout.addLayout(top)
 
         self.info_card = QFrame()
         self.info_card.setObjectName("Card")
         info_layout = QVBoxLayout(self.info_card)
-        info_layout.setContentsMargins(14, 10, 14, 10)
-        info_layout.setSpacing(4)
+        info_layout.setContentsMargins(16, 12, 16, 12)
+        info_layout.setSpacing(6)
         self.lbl_name = QLabel("未选择自检目标")
         self.lbl_name.setStyleSheet("font-size:15px; font-weight:600;")
         self.lbl_path = QLabel("路径：—")
@@ -267,6 +281,7 @@ class WatchTab(QWidget):
         self.btn_remove.setEnabled(has and not self._busy)
         self.btn_reset.setEnabled(has and not self._busy)
         self.btn_check.setEnabled(has and not self._busy)
+        self.btn_changes.setEnabled(has and not self._busy)
         if not has:
             self._reset_cards()
             self.status_label.setText("")
@@ -388,14 +403,14 @@ class WatchTab(QWidget):
         if target is None:
             return
         box = QMessageBox(self)
-        box.setWindowTitle("删除自检目标")
+        box.setWindowTitle("移除自检目标")
         box.setIcon(QMessageBox.Question)
-        box.setText(f"确定删除「{target.name}」吗？")
+        box.setText(f"把「{target.name}」移到回收站？")
         box.setInformativeText(
-            "只删除软件里的自检记录（含基线和历次复检结果），不影响硬盘上的任何文件。\n"
-            "删除后需要重新建立基线。"
+            "基线和历次复检结果都会保留，可在底部状态栏的【回收站】里恢复。\n"
+            "硬盘上的文件不会有任何改动。"
         )
-        confirm = box.addButton("删除", QMessageBox.AcceptRole)
+        confirm = box.addButton("移到回收站", QMessageBox.AcceptRole)
         box.addButton("取消", QMessageBox.RejectRole)
         box.setDefaultButton(confirm)
         box.exec()
@@ -407,6 +422,37 @@ class WatchTab(QWidget):
             self._warn(str(exc))
             return
         self._reload()
+
+    def on_compare_with_last(self) -> None:
+        target = self.current_target()
+        if target is None:
+            return
+        try:
+            runs = self.watch.recent_checks(target.id, 2)
+            new_root = old_root = None
+            if len(runs) >= 2:
+                new_root = difftree.load_watch(self.watch, runs[0]["run_id"])
+                old_root = difftree.load_watch(self.watch, runs[1]["run_id"])
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"读取历史记录失败：{exc}")
+            return
+
+        if len(runs) < 2:
+            QMessageBox.information(
+                self,
+                "还没有可对比的记录",
+                f"这个自检目标目前只有 {len(runs)} 次复检记录（建立基线那次不算）。\n"
+                "再复检一次就能看出哪些文件是新出现的问题。",
+            )
+            return
+
+        changes = difftree.diff_problems(old_root, new_root)
+        ChangesDialog(
+            changes,
+            f"本次（{runs[0]['timestamp']}）",
+            f"上次（{runs[1]['timestamp']}）",
+            self,
+        ).exec()
 
     def on_reset_baseline(self) -> None:
         if self._busy:
@@ -480,6 +526,8 @@ class WatchTab(QWidget):
         if box.clickedButton() is not confirm:
             return
 
+        self._activity_prefix = "建立基线" if first else "单盘复检"
+        self._activity_text = f"{self._activity_prefix} 0%"
         self._set_busy(True)
         self.progress_box.show()
         self.progress_bar.setValue(0)
@@ -506,6 +554,10 @@ class WatchTab(QWidget):
             total = info.get("total_bytes") or 0
             done = info.get("bytes") or 0
             self.progress_bar.setValue(int((done / total if total else 0) * 1000))
+            self.activity.emit(
+                f"{getattr(self, '_activity_prefix', '单盘复检')}"
+                f" {int((done / total if total else 0) * 100)}%"
+            )
             rate = info.get("rate") or 0
             eta = info.get("eta") or 0
             if eta >= 3600:
@@ -545,10 +597,12 @@ class WatchTab(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.btn_check.setEnabled(not busy)
+        self.btn_changes.setEnabled(not busy)
         self.btn_new.setEnabled(not busy)
         self.btn_remove.setEnabled(not busy)
         self.btn_reset.setEnabled(not busy)
         self.target_combo.setEnabled(not busy)
+        self.activity.emit(self._activity_text if busy else "")
 
     # ------------------------------------------------------------------ #
     # 结果渲染

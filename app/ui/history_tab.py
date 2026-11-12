@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import difftree, verify, watch
+from .. import difftree, pairing, verify, watch
 from ..pairing import PairStore
 from . import theme
 from .common import fmt_size
@@ -34,11 +34,6 @@ _STATUS_TEXT = {
     "finished": "完成",
     "paused": "已中断",
     "running": "进行中",
-}
-
-_SOURCE_TEXT = {
-    "watch": "单盘自检",
-    "pair": "盘对校验",
 }
 
 
@@ -124,8 +119,11 @@ class HistoryTab(QWidget):
 
     # ------------------------------------------------------------------ #
     def refresh(self) -> None:
-        records = watch.all_runs(self.store, 300) + verify.all_runs(self.store, 300)
-        # 结构比对（runs 表）也一并纳入，方便对照"结构比对 → 内容校验"的先后
+        records = (
+            watch.all_runs(self.store, 300)
+            + verify.all_runs(self.store, 300)
+            + self.store.all_runs(300)   # 结构比对（runs 表）
+        )
         records.sort(key=lambda r: r.get("finished") or r.get("started") or "", reverse=True)
         self._records = records
         self._render_list()
@@ -143,12 +141,17 @@ class HistoryTab(QWidget):
         for row, record in enumerate(records):
             when = record.get("finished") or record.get("started") or ""
             self.run_table.setItem(row, 0, QTableWidgetItem(when))
-            self.run_table.setItem(row, 1, QTableWidgetItem(_SOURCE_TEXT.get(record["source"], "")))
-
             kind = record.get("kind", "")
             title = record.get("title", "")
-            if record["source"] == "watch" and kind == "baseline":
-                title = f"{title}（建立基线）"
+            if record["source"] == "watch":
+                type_text = "单盘自检"
+                if kind == "baseline":
+                    title = f"{title}（建立基线）"
+            elif kind == "compare":
+                type_text = "结构比对"
+            else:
+                type_text = "内容校验"
+            self.run_table.setItem(row, 1, QTableWidgetItem(type_text))
             self.run_table.setItem(row, 2, QTableWidgetItem(title))
 
             status_item = QTableWidgetItem(_STATUS_TEXT.get(record.get("status", ""), ""))
@@ -215,8 +218,12 @@ class HistoryTab(QWidget):
         else:
             self.detail_stack.setCurrentIndex(0)
             try:
-                root = difftree.load_verify(self.store, record["run_id"])
-                source = "内容校验"
+                if record.get("kind") == "compare":
+                    root = difftree.load_compare(self.store, record["run_id"])
+                    source = "结构比对"
+                else:
+                    root = difftree.load_verify(self.store, record["run_id"])
+                    source = "内容校验"
             except Exception as exc:  # noqa: BLE001
                 self.detail_label.setText(f"读取明细失败：{exc}")
                 self.pair_view.clear()
